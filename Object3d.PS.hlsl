@@ -47,7 +47,11 @@ PixelShaderOutput main(VertexShaderOutput input)
         // N dot L
         float NdotL = dot(normalize(input.normal), -gDirectionalLight.direction);
         float cos = saturate(NdotL); 
-        output.color = gMaterial.color * textureColor * gDirectionalLight.color * cos * gDirectionalLight.intensity;
+        
+        // rgb だけにライティングを適用
+        output.color.rgb = gMaterial.color.rgb * textureColor.rgb * gDirectionalLight.color.rgb * cos * gDirectionalLight.intensity;
+        // a はライティングの影響を受けないように個別に計算
+        output.color.a = gMaterial.color.a * textureColor.a;
     }
     // 2: Half Lambert
     else if (gMaterial.lightingType == 2)
@@ -55,7 +59,10 @@ PixelShaderOutput main(VertexShaderOutput input)
         float NdotL = dot(normalize(input.normal), -gDirectionalLight.direction);
     // NdotL (-1.0 ～ 1.0) を (0.0 ～ 1.0) に変換して2乗
         float halfLambert = pow((NdotL * 0.5f) + 0.5f, 2.0f);
-        output.color = gMaterial.color * textureColor * gDirectionalLight.color * halfLambert * gDirectionalLight.intensity;
+        // rgb だけにライティングを適用
+        output.color.rgb = gMaterial.color.rgb * textureColor.rgb * gDirectionalLight.color.rgb * halfLambert * gDirectionalLight.intensity;
+        // a はライティングの影響を受けないように個別に計算
+        output.color.a = gMaterial.color.a * textureColor.a;
     }
     else
     {
