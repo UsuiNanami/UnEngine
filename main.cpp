@@ -25,6 +25,7 @@
 #include "DebugCamera.h" 
 #include <vector>
 
+
 #ifdef USE_IMGUI
 #include "externals/imgui/imgui.h"             // ImGuiを使うためのヘッダ  
 #include "externals/imgui/imgui_impl_dx12.h"   // ImGuiのDirectX 12用の実装を使うためのヘッダ
@@ -556,6 +557,12 @@ ModelData LoadObjFile(const std::string& directoryPath, const std::string& filen
 			s >> normal.x >> normal.y >> normal.z;
 			normals.push_back(normal);
 		}
+		else if (identifier == "mtllib") { // mtlファイルの指定
+			std::string materialFilename;
+			s >> materialFilename;
+			// mtlファイルを解析してテクスチャパス等を取得 
+			currentMesh.material = LoadMaterialTemplateFile(directoryPath, materialFilename);
+		}
 		else if (identifier == "usemtl") { // マテリアルの切り替え
 			// 既に頂点データが入っている場合は、前のメッシュとして登録してリセット
 			if (!currentMesh.vertices.empty()) {
@@ -596,9 +603,9 @@ ModelData LoadObjFile(const std::string& directoryPath, const std::string& filen
 			}
 
 			// 現在のメッシュに頂点を追加
-            currentMesh.vertices.push_back(triangle[2]);
-            currentMesh.vertices.push_back(triangle[1]);
-            currentMesh.vertices.push_back(triangle[0]);
+			currentMesh.vertices.push_back(triangle[2]);
+			currentMesh.vertices.push_back(triangle[1]);
+			currentMesh.vertices.push_back(triangle[0]);
 		}
 	}
 
@@ -789,6 +796,24 @@ bool IsReleaseTriggerKey(uint8_t keyCode) {
 	return ((key[keyCode] & 0x80) == 0) && ((keyPre[keyCode] & 0x80) != 0);
 }
 
+enum BlendMode {
+	// 0: ブレンドなし
+	kBlendModeNone,
+	// 1: 通常のαブレンド
+	kBlendModeNormal,
+	// 2: 加算合成
+	kBlendModeAdd,
+	// 3: 減算合成
+	kBlendModeSubtract,
+	// 4: 乗算合成
+	kBlendModeMultiply,
+	// 5: スクリーン合成
+	kBlendModeScreen,
+	// 利用してはいけない
+	kCountOfBlendModes,
+};
+// ブレンドモードごとのパイプラインステートを保持する配列
+Microsoft::WRL::ComPtr<ID3D12PipelineState> graphicsPipelineStates[kCountOfBlendModes];
 
 // ====================================================
 // ---------- Windowsアプリのエントリーポイント --------- 
@@ -820,8 +845,6 @@ int WINAPI WinMain(_In_ HINSTANCE, _In_opt_ HINSTANCE, _In_ LPSTR, _In_ int) {
 	HRESULT result = XAudio2Create(&xAudio2, 0, XAUDIO2_DEFAULT_PROCESSOR);
 	// マスターボイスを生成
 	result = xAudio2->CreateMasteringVoice(&masterVoice);
-	// 音声読み込み 
-	// SoundData soundData1 = SoundLoadWave("Resources/fanfare.wav");
 
 	// ----- クラッシュハンドラ設定 -----
 	SetUnhandledExceptionFilter(ExportDump);
@@ -855,7 +878,7 @@ int WINAPI WinMain(_In_ HINSTANCE, _In_opt_ HINSTANCE, _In_ LPSTR, _In_ int) {
 		wc.hInstance,           // インスタンスハンドル
 		nullptr);               // オプション 
 
-	// ウィンドウを表示させる
+	// ウィンドウを表示させる 
 	ShowWindow(hwnd, SW_SHOW);
 
 #ifdef _DEBUG
@@ -1091,231 +1114,142 @@ int WINAPI WinMain(_In_ HINSTANCE, _In_opt_ HINSTANCE, _In_ LPSTR, _In_ int) {
 			L"ps_6_0", dxcUtils, dxcCompiler, includeHandler, logFile);
 	assert(pixelShaderBlob != nullptr);
 
-
 	// ====================================================
-	// DepthStencilState の設定
-	// ==================================================== 
-	D3D12_DEPTH_STENCIL_DESC depthStencilDesc{};
-	depthStencilDesc.DepthEnable = true; // 深度テストを有効化
-	depthStencilDesc.DepthWriteMask = D3D12_DEPTH_WRITE_MASK_ALL; // 深度値を書き込む
-	depthStencilDesc.DepthFunc = D3D12_COMPARISON_FUNC_LESS_EQUAL;
+	// BlendState の設定
+	// ====================================================
+	for (uint32_t i = 0; i < kCountOfBlendModes; ++i) {
+		D3D12_BLEND_DESC blendDesc{};
+		blendDesc.RenderTarget[0].RenderTargetWriteMask = D3D12_COLOR_WRITE_ENABLE_ALL;
+		blendDesc.RenderTarget[0].BlendEnable = true;
+		blendDesc.RenderTarget[0].SrcBlendAlpha = D3D12_BLEND_ONE;
+		blendDesc.RenderTarget[0].BlendOpAlpha = D3D12_BLEND_OP_ADD;
+		blendDesc.RenderTarget[0].DestBlendAlpha = D3D12_BLEND_ZERO;
 
-	depthStencilDesc.StencilEnable = false; // ステンシルは今回は使わない
-	depthStencilDesc.StencilReadMask = D3D12_DEFAULT_STENCIL_READ_MASK;
-	depthStencilDesc.StencilWriteMask = D3D12_DEFAULT_STENCIL_WRITE_MASK;
+		// ====================================================
+		// ブレンドモードごとの設定
+		// ====================================================
+		switch (i) {
+		case kBlendModeNone: // ブレンドなし
+			blendDesc.RenderTarget[0].BlendEnable = false;
+			break;
 
-	// ----- PSOの生成 -----  
-	D3D12_GRAPHICS_PIPELINE_STATE_DESC graphicsPipelineStateDesc{};
-	graphicsPipelineStateDesc.pRootSignature = rootSignature.Get();
-	graphicsPipelineStateDesc.InputLayout = inputLayoutDesc;
-	graphicsPipelineStateDesc.VS = {
-	vertexShaderBlob->GetBufferPointer(),
-	vertexShaderBlob->GetBufferSize()
-	};
-	graphicsPipelineStateDesc.PS = {
-	pixelShaderBlob->GetBufferPointer(),
-	pixelShaderBlob->GetBufferSize()
-	};
-	graphicsPipelineStateDesc.BlendState = blendDesc;
-	graphicsPipelineStateDesc.RasterizerState = rasterizerDesc;
+		case kBlendModeNormal: // 通常αブレンド
+			blendDesc.RenderTarget[0].SrcBlend = D3D12_BLEND_SRC_ALPHA;
+			blendDesc.RenderTarget[0].BlendOp = D3D12_BLEND_OP_ADD;
+			blendDesc.RenderTarget[0].DestBlend = D3D12_BLEND_INV_SRC_ALPHA;
+			break;
 
-	// DepthStencilの設定
-	graphicsPipelineStateDesc.DepthStencilState = depthStencilDesc;
-	graphicsPipelineStateDesc.DSVFormat = DXGI_FORMAT_D24_UNORM_S8_UINT;
+		case kBlendModeAdd: // 加算合成
+			blendDesc.RenderTarget[0].SrcBlend = D3D12_BLEND_SRC_ALPHA;
+			blendDesc.RenderTarget[0].BlendOp = D3D12_BLEND_OP_ADD;
+			blendDesc.RenderTarget[0].DestBlend = D3D12_BLEND_ONE;
+			break;
 
-	graphicsPipelineStateDesc.NumRenderTargets = 1;
-	graphicsPipelineStateDesc.RTVFormats[0] = DXGI_FORMAT_R8G8B8A8_UNORM_SRGB;
+		case kBlendModeSubtract: // 減算合成
+			blendDesc.RenderTarget[0].SrcBlend = D3D12_BLEND_SRC_ALPHA;
+			blendDesc.RenderTarget[0].BlendOp = D3D12_BLEND_OP_REV_SUBTRACT;
+			blendDesc.RenderTarget[0].DestBlend = D3D12_BLEND_ONE;
+			break;
 
-	graphicsPipelineStateDesc.PrimitiveTopologyType = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
+		case kBlendModeMultiply: // 乗算合成
+			blendDesc.RenderTarget[0].SrcBlend = D3D12_BLEND_DEST_COLOR;
+			blendDesc.RenderTarget[0].BlendOp = D3D12_BLEND_OP_ADD;
+			blendDesc.RenderTarget[0].DestBlend = D3D12_BLEND_ZERO;
+			break;
 
-	graphicsPipelineStateDesc.SampleDesc.Count = 1;
-	graphicsPipelineStateDesc.SampleMask = D3D12_DEFAULT_SAMPLE_MASK;
+		case kBlendModeScreen: // スクリーン合成
+			blendDesc.RenderTarget[0].SrcBlend = D3D12_BLEND_INV_DEST_COLOR;
+			blendDesc.RenderTarget[0].BlendOp = D3D12_BLEND_OP_ADD;
+			blendDesc.RenderTarget[0].DestBlend = D3D12_BLEND_ONE;
+			break;
 
-	Microsoft::WRL::ComPtr<ID3D12PipelineState> graphicsPipelineState;
-	hr = device->CreateGraphicsPipelineState(
-		&graphicsPipelineStateDesc,
-		IID_PPV_ARGS(&graphicsPipelineState)
-	);
-	assert(SUCCEEDED(hr));
+		}
 
+		// ====================================================
+		// DepthStencilState の設定
+		// ==================================================== 
+		D3D12_DEPTH_STENCIL_DESC depthStencilDesc{};
+		depthStencilDesc.DepthEnable = true; // 深度テストを有効化 
+		depthStencilDesc.DepthWriteMask = D3D12_DEPTH_WRITE_MASK_ALL; // 深度値を書き込む
+		depthStencilDesc.DepthFunc = D3D12_COMPARISON_FUNC_LESS_EQUAL;
+		depthStencilDesc.StencilEnable = false; // ステンシルは今回は使わない
+		depthStencilDesc.StencilReadMask = D3D12_DEFAULT_STENCIL_READ_MASK;
+		depthStencilDesc.StencilWriteMask = D3D12_DEFAULT_STENCIL_WRITE_MASK;
 
-	// =====================================================
-	// VertexResourceの生成
-	// =====================================================
-	// --- モデルデータの読み込み ---
-    // ----- VertexResourceの生成 -----
-	//const uint32_t kSubdivision = 16;
-	//const uint32_t sphereVertexCount = (kSubdivision + 1) * (kSubdivision + 1); // 球の頂点数
-	//const uint32_t sphereIndexCount = kSubdivision * kSubdivision * 6; // 球のインデックス数
+		// ====================================================
+		// PSOの生成
+		// ====================================================
+		D3D12_GRAPHICS_PIPELINE_STATE_DESC graphicsPipelineStateDesc{};
+		graphicsPipelineStateDesc.pRootSignature = rootSignature.Get();
+		graphicsPipelineStateDesc.InputLayout = inputLayoutDesc;
+		graphicsPipelineStateDesc.VS = {
+		vertexShaderBlob->GetBufferPointer(),
+		vertexShaderBlob->GetBufferSize()
+		};
+		graphicsPipelineStateDesc.PS = {
+		pixelShaderBlob->GetBufferPointer(),
+		pixelShaderBlob->GetBufferSize()
+		};
+		graphicsPipelineStateDesc.BlendState = blendDesc;
+		graphicsPipelineStateDesc.RasterizerState = rasterizerDesc;
 
-	//// --- 球データ --- 
-	//Sphere sphere{ {0.0f, 0.0f, 0.0f}, 0.5f };
+		// DepthStencilの設定
+		graphicsPipelineStateDesc.DepthStencilState = depthStencilDesc;
+		graphicsPipelineStateDesc.DSVFormat = DXGI_FORMAT_D24_UNORM_S8_UINT;
+		graphicsPipelineStateDesc.NumRenderTargets = 1;
+		graphicsPipelineStateDesc.RTVFormats[0] = DXGI_FORMAT_R8G8B8A8_UNORM_SRGB;
+		graphicsPipelineStateDesc.PrimitiveTopologyType = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
+		graphicsPipelineStateDesc.SampleDesc.Count = 1;
+		graphicsPipelineStateDesc.SampleMask = D3D12_DEFAULT_SAMPLE_MASK;
 
-	//// 球用の頂点リソース 
-	//Microsoft::WRL::ComPtr<ID3D12Resource> vertexResourceSphere =
-	//	CreateBufferResource(device, sizeof(VertexData) * sphereVertexCount);
-
-	//// VertexBufferView設定 
-	//D3D12_VERTEX_BUFFER_VIEW vertexBufferViewSphere{};
-	//vertexBufferViewSphere.BufferLocation = vertexResourceSphere->GetGPUVirtualAddress();
-	//vertexBufferViewSphere.SizeInBytes = sizeof(VertexData) * sphereVertexCount;
-	//vertexBufferViewSphere.StrideInBytes = sizeof(VertexData);
-
-	//// 頂点データ書き込み　
-	//VertexData* vertexDataSphere = nullptr;
-	//vertexResourceSphere->Map(0, nullptr, reinterpret_cast<void**>(&vertexDataSphere));
-	//CreateSphereVertices(sphere, vertexDataSphere, kSubdivision);
-	//vertexResourceSphere->Unmap(0, nullptr);
-
-	//// 3D用マテリアル 
-
-	//Microsoft::WRL::ComPtr<ID3D12Resource> materialResource =
-	//	CreateBufferResource(device, sizeof(Material));
-
-	//Material* materialData = nullptr;
-	//materialResource->Map(0, nullptr, reinterpret_cast<void**>(&materialData));
-	//materialData->color = { 1.0f, 1.0f, 1.0f, 1.0f };               // RGBA
-	//materialData->lightingType = Lighting_HalfLambert;              // 3Dはライティング有効
-	//materialData->uvTransform = MyMath::Identity();                 // UV変換行列を初期化
-	//materialResource->Unmap(0, nullptr);
-
-
-	//// 球用のIndex CreateBufferResource
-	//Microsoft::WRL::ComPtr<ID3D12Resource> indexResourceSphere =
-	//	CreateBufferResource(device, sizeof(uint32_t) * sphereIndexCount);
-
-	//D3D12_INDEX_BUFFER_VIEW indexBufferViewSphere{};
-	//indexBufferViewSphere.BufferLocation = indexResourceSphere->GetGPUVirtualAddress();
-	//indexBufferViewSphere.SizeInBytes = sizeof(uint32_t) * sphereIndexCount;
-	//indexBufferViewSphere.Format = DXGI_FORMAT_R32_UINT;
-
-	//// インデックスリソースにデータを書き込む 
-	//uint32_t* indexDataSphere = nullptr;
-	//indexResourceSphere->Map(0, nullptr, reinterpret_cast<void**>(&indexDataSphere));
-	//CreateSphereIndices(indexDataSphere, kSubdivision);
-	//indexResourceSphere->Unmap(0, nullptr);
-
-
-	//// --- OBJモデルデータの読み込み ---
-	//ModelData multiMeshModel = LoadObjFile("resources", "multiMesh.obj");
-
-	//for (auto& mesh : multiMeshModel.meshes) {
-	//	mesh.vertexResource = CreateBufferResource(device, sizeof(VertexData) * mesh.vertices.size());
-
-	//	mesh.vertexBufferView.BufferLocation = mesh.vertexResource->GetGPUVirtualAddress();
-	//	mesh.vertexBufferView.SizeInBytes = UINT(sizeof(VertexData) * mesh.vertices.size());
-	//	mesh.vertexBufferView.StrideInBytes = sizeof(VertexData);
-
-	//	VertexData* mappedData = nullptr;
-	//	mesh.vertexResource->Map(0, nullptr, reinterpret_cast<void**>(&mappedData));
-	//	std::memcpy(mappedData, mesh.vertices.data(), sizeof(VertexData) * mesh.vertices.size());
-	//	mesh.vertexResource->Unmap(0, nullptr);
-	//}
-
-	//// obj用マテリアル 
-	//Microsoft::WRL::ComPtr<ID3D12Resource> materialResourceModel =
-	//	CreateBufferResource(device, sizeof(Material));
-
-	//Material* materialDataModel = nullptr;
-	//materialResourceModel->Map(0, nullptr, reinterpret_cast<void**>(&materialDataModel));
-	//materialDataModel->color = { 1.0f, 1.0f, 1.0f, 1.0f };               // RGBA
-	//materialDataModel->lightingType = Lighting_HalfLambert;              // 3Dはライティング有効
-	//materialDataModel->uvTransform = MyMath::Identity();                 // UV変換行列を初期化
-	//materialResourceModel->Unmap(0, nullptr);
-
-
-	// --- Sprite用(2D)の頂点リソースを作る ---
-	Microsoft::WRL::ComPtr<ID3D12Resource> vertexResourceSprite =
-		CreateBufferResource(device, sizeof(VertexData) * 4); // 頂点データが4つ分に変更
-	D3D12_VERTEX_BUFFER_VIEW vertexBufferViewSprite{};
-	vertexBufferViewSprite.BufferLocation = vertexResourceSprite->GetGPUVirtualAddress();
-	vertexBufferViewSprite.SizeInBytes = sizeof(VertexData) * 4;// 頂点データが4つ分 
-	vertexBufferViewSprite.StrideInBytes = sizeof(VertexData);  // 1頂点あたりのサイズ
-
-	// 矩形追加
-	VertexData* vertexDataSprite = nullptr;
-	vertexResourceSprite->Map(0, nullptr, reinterpret_cast<void**>(&vertexDataSprite));
-
-	// 左下
-	vertexDataSprite[0].position = { 0.0f, 360.0f, 0.0f, 1.0f };
-	vertexDataSprite[0].texcoord = { 0.0f, 1.0f };
-	vertexDataSprite[0].normal = { 0.0f, 0.0f, -1.0f };
-
-	// 左上
-	vertexDataSprite[1].position = { 0.0f, 0.0f, 0.0f, 1.0f };
-	vertexDataSprite[1].texcoord = { 0.0f, 0.0f };
-	vertexDataSprite[1].normal = { 0.0f, 0.0f, -1.0f };
-
-	// 右下
-	vertexDataSprite[2].position = { 640.0f, 360.0f, 0.0f, 1.0f };
-	vertexDataSprite[2].texcoord = { 1.0f, 1.0f };
-	vertexDataSprite[2].normal = { 0.0f, 0.0f, -1.0f };
-
-	// 右上
-	vertexDataSprite[3].position = { 640.0f, 0.0f, 0.0f, 1.0f };
-	vertexDataSprite[3].texcoord = { 1.0f, 0.0f };
-	vertexDataSprite[3].normal = { 0.0f, 0.0f, -1.0f };
-
-	vertexResourceSprite->Unmap(0, nullptr);
-
-
-	//// --- 複数オブジェクト用のデータ作成 ---
-	//for (size_t i = 0; i < objects.size(); ++i) {
-	//	// それぞれのWVP定数バッファを作成
-	//	objects[i].wvpResource = CreateBufferResource(device, sizeof(TransformationMatrix));
-	//	objects[i].wvpResource->Map(0, nullptr, reinterpret_cast<void**>(&objects[i].wvpData));
-
-	//	// 初期値設定
-	//	objects[i].wvpData->WVP = MyMath::Identity();
-	//	objects[i].wvpData->World = MyMath::Identity();
-	//}
-
-	//// 初期位置
-	//objects[0].transform = { {1.0f, 1.0f, 1.0f}, {0.0f, 0.0f, 0.0f}, {0.0f, 0.0f, 0.0f} };  // 球
-	//objects[1].transform = { {1.0f, 1.0f, 1.0f}, {0.0f, 0.0f, 0.0f}, {5.0f, 0.0f, 0.0f} };  // multiMesh
-	//objects[2].transform = { {1.0f, 1.0f, 1.0f}, {0.0f, 0.0f, 0.0f}, {0.0f, 0.0f, 0.0f} };  // Teapot
-	//objects[3].transform = { {1.0f, 1.0f, 1.0f}, {0.0f, 0.0f, 0.0f}, {0.0f, 0.0f, 0.0f} };  // Bunny
-
-	// --- 複数Sprite用のデータ作成 ---
-	for (size_t i = 0; i < sprites.size(); ++i) {
-		// それぞれのWVP定数バッファを作成
-		sprites[i].wvpResource = CreateBufferResource(device, sizeof(TransformationMatrix));
-		sprites[i].wvpResource->Map(0, nullptr, reinterpret_cast<void**>(&sprites[i].wvpData));
-
-		// 初期値設定
-		sprites[i].wvpData->WVP = MyMath::Identity();
-		sprites[i].wvpData->World = MyMath::Identity();
+		hr = device->CreateGraphicsPipelineState(
+			&graphicsPipelineStateDesc,
+			IID_PPV_ARGS(&graphicsPipelineStates[i])
+		);
+		assert(SUCCEEDED(hr));
 	}
 
-	// 2D Spriteの初期位置
-	sprites[0].transform = { {1.0f, 1.0f, 1.0f}, {0.0f, 0.0f, 0.0f}, { 100.0f, 100.0f, 0.0f} };
 
-	// Sprite用のマテリアルリソースを作成 
-	Microsoft::WRL::ComPtr<ID3D12Resource> materialResourceSprite =
+	// ===================================================== 
+	// VertexResourceの生成
+	// =====================================================
+	// objファイルの読み込み
+	// --- fenceモデルデータの読み込み --- LoadObjFile
+	//ModelData fenceModel = LoadObjFile("resources", "fence.obj");
+	ModelData fenceModel = LoadObjFile("resources/fence", "fence.obj");
+
+	for (auto& mesh : fenceModel.meshes) {
+		mesh.vertexResource = CreateBufferResource(device, sizeof(VertexData) * mesh.vertices.size());
+
+		mesh.vertexBufferView.BufferLocation = mesh.vertexResource->GetGPUVirtualAddress();
+		mesh.vertexBufferView.SizeInBytes = UINT(sizeof(VertexData) * mesh.vertices.size());
+		mesh.vertexBufferView.StrideInBytes = sizeof(VertexData);
+
+		VertexData* mappedData = nullptr;
+		mesh.vertexResource->Map(0, nullptr, reinterpret_cast<void**>(&mappedData));
+		std::memcpy(mappedData, mesh.vertices.data(), sizeof(VertexData) * mesh.vertices.size());
+		mesh.vertexResource->Unmap(0, nullptr);
+	}
+
+	// fence用マテリアル
+	Microsoft::WRL::ComPtr<ID3D12Resource> materialResourceFence =
 		CreateBufferResource(device, sizeof(Material));
-	Material* materialDataSprite = nullptr;
-	materialResourceSprite->Map(0, nullptr, reinterpret_cast<void**>(&materialDataSprite));
-	materialDataSprite->color = { 1.0f, 1.0f, 1.0f, 1.0f };       // RGBA
-	materialDataSprite->lightingType = Lighting_None;             // Spriteはライティング無効
-	materialDataSprite->uvTransform = MyMath::Identity();         // UV変換行列を初期化 
-	materialResourceSprite->Unmap(0, nullptr);
 
-	// Sprite用Index  
-	Microsoft::WRL::ComPtr<ID3D12Resource> indexResourceSprite =
-		CreateBufferResource(device, sizeof(uint32_t) * 6);
+	Material* materialDataFence = nullptr;
+	materialResourceFence->Map(0, nullptr, reinterpret_cast<void**>(&materialDataFence));
+	materialDataFence->color = { 1.0f, 1.0f, 1.0f, 1.0f };               // RGBA
+	materialDataFence->lightingType = Lighting_HalfLambert;              // 3Dはライティング有効
+	materialDataFence->uvTransform = MyMath::Identity();                 // UV変換行列を初期化
+	materialResourceFence->Unmap(0, nullptr);
 
-	// View 
-	D3D12_INDEX_BUFFER_VIEW indexBufferViewSprite{};
-	indexBufferViewSprite.BufferLocation = indexResourceSprite->GetGPUVirtualAddress();
-	indexBufferViewSprite.SizeInBytes = sizeof(uint32_t) * 6;
-	indexBufferViewSprite.Format = DXGI_FORMAT_R32_UINT;
+	// フェンス用のTransform変数とWVPリソース
+	Transform fenceTransform = { {1.0f, 1.0f, 1.0f}, {0.0f, 0.0f, 0.0f}, {0.0f, 0.0f, 0.0f} };
 
-	// インデックスリソースにデータを書き込む
-	uint32_t* indexDataSprite = nullptr;
-	indexResourceSprite->Map(0, nullptr, reinterpret_cast<void**>(&indexDataSprite));
-	indexDataSprite[0] = 0; indexDataSprite[1] = 1; indexDataSprite[2] = 2;
-	indexDataSprite[3] = 1; indexDataSprite[4] = 3; indexDataSprite[5] = 2;
-
+	Microsoft::WRL::ComPtr<ID3D12Resource> fenceWvpResource = CreateBufferResource(device, sizeof(TransformationMatrix));
+	TransformationMatrix* fenceWvpData = nullptr;
+	fenceWvpResource->Map(0, nullptr, reinterpret_cast<void**>(&fenceWvpData));
+	fenceWvpData->WVP = MyMath::Identity();
+	fenceWvpData->World = MyMath::Identity();
 
 
 	// --- 平行光源用 ---  
@@ -1330,7 +1264,7 @@ int WINAPI WinMain(_In_ HINSTANCE, _In_opt_ HINSTANCE, _In_ LPSTR, _In_ int) {
 	directionalLightData->intensity = 1.0f;
 
 	// --- サウンド再生 ---
-	// SoundPlayWave(xAudio2.Get(), soundData1); // 音声データ解放 
+	// SoundPlayWave(xAudio2.Get(), soundData1); // 音声データ解放  
 
 
 	// ----- ViewportとScissorの設定 ----- 
@@ -1425,10 +1359,8 @@ int WINAPI WinMain(_In_ HINSTANCE, _In_opt_ HINSTANCE, _In_ LPSTR, _In_ int) {
 		CreateDescriptorHeap(device, D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, 128, true); // SRV用のヒープ
 
 
-	// ----- テクスチャを呼んで転送する ----- 
-	DirectX::ScratchImage mipImages = LoadTexture("Resources/uvChecker.png");
-	//DirectX::ScratchImage mipImages = LoadTexture(modelData.material.textureFilePath);
-	const DirectX::TexMetadata& metadata = mipImages.GetMetadata();
+	// ----- テクスチャを呼んで転送する -----  
+	DirectX::ScratchImage mipImages = LoadTexture(fenceModel.meshes[0].material.textureFilePath);	const DirectX::TexMetadata& metadata = mipImages.GetMetadata();
 	Microsoft::WRL::ComPtr<ID3D12Resource> textureResource =
 		CreateTextureResource(device, metadata);
 	ID3D12Resource* intermediateResource = UploadTextureData(textureResource.Get(), mipImages, device.Get(), commandList.Get());
@@ -1539,7 +1471,7 @@ int WINAPI WinMain(_In_ HINSTANCE, _In_opt_ HINSTANCE, _In_ LPSTR, _In_ int) {
 	assert(SUCCEEDED(hr));
 
 	intermediateResource->Release();
-	intermediateResource2->Release();
+	intermediateResource2->Release(); // 
 
 
 
@@ -1598,79 +1530,6 @@ int WINAPI WinMain(_In_ HINSTANCE, _In_opt_ HINSTANCE, _In_ LPSTR, _In_ int) {
 			ImGui_ImplWin32_NewFrame();
 			ImGui::NewFrame();
 
-
-			// =====================================
-			// 3Dモデル
-			// =====================================
-			//ImGui::Begin("BallModel");
-
-			//ImGui::SeparatorText("Sphere Model");
-
-			//// 色
-			//static float color[4] = {
-			//	materialData->color.x,
-			//	materialData->color.y,
-			//	materialData->color.z,
-			//	materialData->color.w
-			//};
-			//if (ImGui::ColorEdit4("BallModel Color", color)) {
-			//	materialData->color.x = color[0];
-			//	materialData->color.y = color[1];
-			//	materialData->color.z = color[2];
-			//	materialData->color.w = color[3];
-			//}
-
-			//// テクスチャ切り替え
-			//ImGui::Checkbox("Texture Switching", &useMonsterBall);
-
-			//// SRT
-			//ImGui::DragFloat3("BallModel Scale", &objects[0].transform.scale.x, 0.01f);
-			//ImGui::SliderAngle("BallModel RotateX", &objects[0].transform.rotate.x);
-			//ImGui::SliderAngle("BallModel RotateY", &objects[0].transform.rotate.y);
-			//ImGui::SliderAngle("BallModel RotateZ", &objects[0].transform.rotate.z);
-			//ImGui::DragFloat3("BallModel Translate", &objects[0].transform.translate.x, 0.1f);
-
-			//// ライティング切り替え
-			//ImGui::Text("Lighting Type");
-			//ImGui::RadioButton("None", &materialData->lightingType, Lighting_None); ImGui::SameLine();
-			//ImGui::RadioButton("Lambert", &materialData->lightingType, Lighting_Lambert); ImGui::SameLine();
-			//ImGui::RadioButton("Half Lambert", &materialData->lightingType, Lighting_HalfLambert);
-
-			
-
-			// =====================================
-			// objモデル
-			// =====================================
-			//ImGui::Separator();
-			//ImGui::SeparatorText("Obj Model");
-			//
-			//// 色
-			//static float colorObj[4] = {
-			//	materialDataModel->color.x,
-			//	materialDataModel->color.y,
-			//	materialDataModel->color.z,
-			//	materialDataModel->color.w
-			//};
-			//if (ImGui::ColorEdit4("Obj Color", colorObj)) {
-			//	materialDataModel->color.x = colorObj[0];
-			//	materialDataModel->color.y = colorObj[1];
-			//	materialDataModel->color.z = colorObj[2];
-			//	materialDataModel->color.w = colorObj[3];
-			//}
-
-			//// SRT
-			//ImGui::DragFloat3("Obj Scale", &objects[1].transform.scale.x, 0.01f);
-			//ImGui::SliderAngle("Obj RotateX", &objects[1].transform.rotate.x);
-			//ImGui::SliderAngle("Obj RotateY", &objects[1].transform.rotate.y);
-			//ImGui::SliderAngle("Obj RotateZ", &objects[1].transform.rotate.z);
-			//ImGui::DragFloat3("Obj Translate", &objects[1].transform.translate.x, 0.1f);
-
-			//// OBJモデルのライティング切替
-			//ImGui::Text("Obj Lighting Type");
-			//ImGui::RadioButton("None##Obj", &materialDataModel->lightingType, Lighting_None); ImGui::SameLine();
-			//ImGui::RadioButton("Lambert##Obj", &materialDataModel->lightingType, Lighting_Lambert); ImGui::SameLine();
-			//ImGui::RadioButton("Half Lambert##Obj", &materialDataModel->lightingType, Lighting_HalfLambert);
-			
 			// ---------------------------------
 			// ライト共通設定
 			// ---------------------------------
@@ -1708,57 +1567,27 @@ int WINAPI WinMain(_In_ HINSTANCE, _In_opt_ HINSTANCE, _In_ LPSTR, _In_ int) {
 			ImGui::SliderAngle("CameraRotateY", &cameraTransform.rotate.y);
 			ImGui::SliderAngle("CameraRotateZ", &cameraTransform.rotate.z);
 
-			//ImGui::End();
-
-			
 
 			// =====================================
-			// Sprite Material
+			// Fence Controls
 			// =====================================
-			ImGui::Begin("SpriteMaterial");
-
-			// 座標
+			ImGui::Begin("Fence");
 			ImGui::SeparatorText("Transform");
-			ImGui::SliderFloat3("Position", &sprites[0].transform.translate.x, 0.0f, 1280.0f);
+			ImGui::DragFloat3("Position", &fenceTransform.translate.x, 0.1f);
+			ImGui::SliderAngle("Rotate X", &fenceTransform.rotate.x);
+			ImGui::SliderAngle("Rotate Y", &fenceTransform.rotate.y);
+			ImGui::SliderAngle("Rotate Z", &fenceTransform.rotate.z);
+			ImGui::DragFloat3("Scale", &fenceTransform.scale.x, 0.1f, 0.01f, 10.0f);
 
-			// 色
-			static float colorSprite[4] = {
-				materialDataSprite->color.x,
-				materialDataSprite->color.y,
-				materialDataSprite->color.z,
-				materialDataSprite->color.w
-			};
-
-			if (ImGui::ColorEdit4("Color", colorSprite)) {
-				materialDataSprite->color.x = colorSprite[0];
-				materialDataSprite->color.y = colorSprite[1];
-				materialDataSprite->color.z = colorSprite[2];
-				materialDataSprite->color.w = colorSprite[3];
+			// マテリアルカラー調整（任意）　
+			static float fenceColor[4] = { 1.0f, 1.0f, 1.0f, 1.0f };
+			if (ImGui::ColorEdit4("Color", fenceColor)) {
+				materialDataFence->color.x = fenceColor[0];
+				materialDataFence->color.y = fenceColor[1];
+				materialDataFence->color.z = fenceColor[2];
+				materialDataFence->color.w = fenceColor[3];
 			}
-
-
-			// スプライトのライティング切替
-			ImGui::Text("Sprite Lighting Type");
-			ImGui::RadioButton("None##Sprite", &materialDataSprite->lightingType, Lighting_None); ImGui::SameLine();
-			ImGui::RadioButton("Lambert##Sprite", &materialDataSprite->lightingType, Lighting_Lambert); ImGui::SameLine();
-			ImGui::RadioButton("Half Lambert##Sprite", &materialDataSprite->lightingType, Lighting_HalfLambert);
-
-
-			// UV変換行列の設定
-			ImGui::SeparatorText("UVTransform");
-			ImGui::DragFloat2("UVTranslate", &uvTransformSprite.translate.x, 0.01f, -10.0f, 10.0f);
-			ImGui::DragFloat2("UVScale", &uvTransformSprite.scale.x, 0.01f, -10.0f, 10.0f);
-			ImGui::SliderAngle("UVRotate", &uvTransformSprite.rotate.z);
-
 			ImGui::End();
-
-			// UV変換行列を作る
-			Matrix4x4 uvTransformMatrix = MyMath::MakeScaleMatrix(uvTransformSprite.scale);
-			uvTransformMatrix = MyMath::Multiply(uvTransformMatrix, MyMath::MakeRotateZMatrix(uvTransformSprite.rotate.z));
-			uvTransformMatrix = MyMath::Multiply(uvTransformMatrix, MyMath::MakeTranslateMatrix(uvTransformSprite.translate));
-
-			// マテリアルに反映
-			materialDataSprite->uvTransform = uvTransformMatrix;
 
 			ImGui::ShowDemoWindow();
 
@@ -1783,29 +1612,14 @@ int WINAPI WinMain(_In_ HINSTANCE, _In_opt_ HINSTANCE, _In_ LPSTR, _In_ int) {
 				viewMatrix = MyMath::Inverse(cameraMatrix);
 			}
 			Matrix4x4 projectionMatrix = MyMath::MakePerspectiveFovMatrix(0.45f, float(kClientWidth) / float(kClientHeight), 0.1f, 100.0f);
-			
-			// 複数オブジェクトの行列更新
-			//for (size_t i = 0; i < objects.size(); ++i) {
-			//	Matrix4x4 worldMatrix = MyMath::MakeAffineMatrix(objects[i].transform.scale, objects[i].transform.rotate, objects[i].transform.translate);
-			//	Matrix4x4 worldViewMatrix = MyMath::Multiply(worldMatrix, viewMatrix);
-			//	Matrix4x4 worldViewProjectionMatrix = MyMath::Multiply(worldViewMatrix, projectionMatrix);
-
-			//	objects[i].wvpData->WVP = worldViewProjectionMatrix;
-			//	objects[i].wvpData->World = worldMatrix;
-			//}
 
 
-			// Sprite用行列更新  
-			Matrix4x4 viewMatrixSprite = MyMath::Identity();
-			Matrix4x4 projectionMatrixSprite = MyMath::MakeOrthographicMatrix(0.0f, 0.0f, float(kClientWidth), float(kClientHeight), 0.0f, 100.0f);
+			// Fenceの行列更新
+			Matrix4x4 fenceWorldMatrix = MyMath::MakeAffineMatrix(fenceTransform.scale, fenceTransform.rotate, fenceTransform.translate);
+			Matrix4x4 fenceWvpMatrix = MyMath::Multiply(fenceWorldMatrix, MyMath::Multiply(viewMatrix, projectionMatrix));
 
-			for (size_t i = 0; i < sprites.size(); ++i) {
-				Matrix4x4 worldMatrixSprite = MyMath::MakeAffineMatrix(sprites[i].transform.scale, sprites[i].transform.rotate, sprites[i].transform.translate);
-				Matrix4x4 worldViewProjectionMatrixSprite = MyMath::Multiply(worldMatrixSprite, MyMath::Multiply(viewMatrixSprite, projectionMatrixSprite));
-
-				sprites[i].wvpData->WVP = worldViewProjectionMatrixSprite;
-				sprites[i].wvpData->World = worldMatrixSprite;
-			}
+			fenceWvpData->World = fenceWorldMatrix;
+			fenceWvpData->WVP = fenceWvpMatrix;
 
 
 			// TransitionBarrierの設定
@@ -1832,69 +1646,33 @@ int WINAPI WinMain(_In_ HINSTANCE, _In_opt_ HINSTANCE, _In_ LPSTR, _In_ int) {
 			commandList->SetGraphicsRootSignature(rootSignature.Get());
 			commandList->RSSetViewports(1, &viewport);
 			commandList->RSSetScissorRects(1, &scissorRect);
-			commandList->SetPipelineState(graphicsPipelineState.Get());
+			//commandList->SetPipelineState(graphicsPipelineStates[currentBlendMode].Get());
+			commandList->SetPipelineState(graphicsPipelineStates[0].Get());
 
 			// =================================  
-            // 3D描画
-            // =================================  
-            // --- 共通設定 ---
+			// 3D描画
+			// =================================  
+			// --- 共通設定 ---
 			// 平行光源
 			commandList->SetGraphicsRootConstantBufferView(3, directionalLightResource->GetGPUVirtualAddress());
 			// トポロジ
 			commandList->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
 
-
-			//// 1. 球体の描画 (objects[0])
-			//// 3D用マテリアル  
-			//commandList->SetGraphicsRootConstantBufferView(1, materialResource->GetGPUVirtualAddress());
-			//// 球体のWVP定数バッファ(objects[0])をセット
-			//commandList->SetGraphicsRootConstantBufferView(0, objects[0].wvpResource->GetGPUVirtualAddress());
-			//// 球体のテクスチャSRVを設定
-			//commandList->SetGraphicsRootDescriptorTable(2, useMonsterBall ? textureSrvHandleGPU2 : textureSrvHandleGPU);
-			//// 球体の頂点バッファとインデックスバッファをセット
-			//commandList->IASetVertexBuffers(0, 1, &vertexBufferViewSphere);
-			//commandList->IASetIndexBuffer(&indexBufferViewSphere);
-			//// 描画実行
-			//commandList->DrawIndexedInstanced(sphereIndexCount, 1, 0, 0, 0);
-
-
-			//// 2. OBJモデルの描画 (objects[1])
-			//// OBJモデルのWVP定数バッファ(objects[1])をセット
-			//commandList->SetGraphicsRootConstantBufferView(0, objects[1].wvpResource->GetGPUVirtualAddress());
-
-			//// メッシュの数だけループして描画
-			//for (const auto& mesh : multiMeshModel.meshes) {
-			//	// メッシュごとの頂点バッファをセット
-			//	commandList->IASetVertexBuffers(0, 1, &mesh.vertexBufferView);
-
-			//	// メッシュごとのマテリアルやテクスチャをセット
-			//	commandList->SetGraphicsRootConstantBufferView(1, materialResourceModel->GetGPUVirtualAddress());
-			//	commandList->SetGraphicsRootDescriptorTable(2, textureSrvHandleGPU);
-
-			//	// 描画実行
-			//	commandList->DrawInstanced(UINT(mesh.vertices.size()), 1, 0, 0);
-			//}
-
 			// =================================
-			// Sprite描画　 
+			// フェンス描画
 			// =================================
-			// Sprite用マテリアルをセット
-			commandList->SetGraphicsRootConstantBufferView(1, materialResourceSprite->GetGPUVirtualAddress());
-			// Spriteのテクスチャ
+			// WVP (b0: VS) のセット
+			commandList->SetGraphicsRootConstantBufferView(0, fenceWvpResource->GetGPUVirtualAddress());
+			// Material (b0: PS) のセット
+			commandList->SetGraphicsRootConstantBufferView(1, materialResourceFence->GetGPUVirtualAddress());
+			// Texture (t0: PS) のセット (1番目のテクスチャuvCheckerなどを使用)
 			commandList->SetGraphicsRootDescriptorTable(2, textureSrvHandleGPU);
-			// 頂点バッファ
-			commandList->IASetVertexBuffers(0, 1, &vertexBufferViewSprite);
-			// インデックスバッファを設定
-			commandList->IASetIndexBuffer(&indexBufferViewSprite);
 
-			// スプライトの数だけWVPを切り替えて描画
-			for (size_t i = 0; i < sprites.size(); ++i) {
-				// i番目のスプライトのWVPバッファをセット
-				commandList->SetGraphicsRootConstantBufferView(0, sprites[i].wvpResource->GetGPUVirtualAddress());
-				// 描画実行
-				commandList->DrawIndexedInstanced(6, 1, 0, 0, 0);
+			// フェンスの全メッシュを描画 
+			for (const auto& mesh : fenceModel.meshes) {
+				commandList->IASetVertexBuffers(0, 1, &mesh.vertexBufferView);
+				commandList->DrawInstanced(static_cast<UINT>(mesh.vertices.size()), 1, 0, 0);
 			}
-
 
 
 #ifdef USE_IMGUI
