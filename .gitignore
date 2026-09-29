@@ -364,3 +364,4 @@ Dumps/
 imgui.ini
 
 !resources/**/*.obj
+generated/
