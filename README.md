@@ -1,2 +1,1 @@
-[[![.github/workflows/DebugBuild.yml](https://github.com/UsuiNanami/UnEngine/actions/workflows/DebugBuild.yml/badge.svg)](https://github.com/UsuiNanami/UnEngine/actions/workflows/DebugBuild.yml)
-](https://github.com/UsuiNanami/UnEngine/actions/workflows/DebugBuild.yml/badge.svg?branch=GE3_04)
+[![DebugBuild](https://github.com/UsuiNanami/UnEngine/actions/workflows/DebugBuild.yml/badge.svg?branch=GE3_04)](https://github.com/UsuiNanami/UnEngine/actions/workflows/DebugBuild.yml)
