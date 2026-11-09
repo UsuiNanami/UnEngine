@@ -61,7 +61,7 @@ void DirectXCommon::Initialize(WinApp* winApp)
 	// DXCコンパイラの生成
 	InitializeDXCCompiler();
 
-	// ImGuiの初期化
+	// ImGuiの初期化 
 	InitializeImGui();
 
 }
@@ -84,7 +84,8 @@ void DirectXCommon::PreDraw()
 	D3D12_CPU_DESCRIPTOR_HANDLE dsvHandle = dsvDescriptorHeap->GetCPUDescriptorHandleForHeapStart();
 	commandList->OMSetRenderTargets(1, &rtvHandles[backBufferIndex], false, &dsvHandle);
 	// --- 画面全体の色をクリア ---
-	float clearColor[] = { 0.1f, 0.25f, 0.5f, 1.0f };
+	// float clearColor[] = { 0.1f, 0.25f, 0.5f, 1.0f };   // 青
+	float clearColor[] = { 0.0f, 0.0f, 0.0f, 1.0f }; // 黒
 	commandList->ClearRenderTargetView(rtvHandles[backBufferIndex], clearColor, 0, nullptr);
 	// --- 画面全体の深度をクリア ---
 	commandList->ClearDepthStencilView(dsvHandle, D3D12_CLEAR_FLAG_DEPTH, 1.0f, 0, 0, nullptr);
@@ -294,7 +295,7 @@ void DirectXCommon::InitializeCommand()
 }
 
 // ==== スワップチェーンの生成 =====
-void DirectXCommon::InitializeSwapChain(){
+void DirectXCommon::InitializeSwapChain() {
 	HRESULT hr;
 	DXGI_SWAP_CHAIN_DESC1 swapChainDesc{};
 	swapChainDesc.Width = WinApp::kClientWidth;
@@ -323,7 +324,7 @@ void DirectXCommon::InitializeDepthBuffer() {
 	// --- 深度バッファリソース設定 ---
 	D3D12_RESOURCE_DESC resourceDesc{};
 	resourceDesc.Width = WinApp::kClientWidth; // Textureの幅
-	resourceDesc.Height = WinApp::kClientHeight	; // Textureの高さ
+	resourceDesc.Height = WinApp::kClientHeight; // Textureの高さ
 	resourceDesc.MipLevels = 1;
 	resourceDesc.DepthOrArraySize = 1;
 	resourceDesc.Format = DXGI_FORMAT_D24_UNORM_S8_UINT; // DepthStencil用フォーマット
@@ -516,14 +517,22 @@ void DirectXCommon::InitializeImGui() {
 	IMGUI_CHECKVERSION();
 	ImGui::CreateContext();
 	ImGui::StyleColorsDark();
-	ImGui_ImplWin32_Init(winApp->GetHwnd()); 
+	ImGui_ImplWin32_Init(winApp->GetHwnd());
 	ImGui_ImplDX12_Init(device.Get(),
-		2,                                 
+		2,
 		DXGI_FORMAT_R8G8B8A8_UNORM_SRGB,
 		srvDescriptorHeap.Get(),
 		srvDescriptorHeap->GetCPUDescriptorHandleForHeapStart(),
 		srvDescriptorHeap->GetGPUDescriptorHandleForHeapStart());
 	ImGuiIO& io = ImGui::GetIO();
+
+	// 日本語を使えるようにする
+	io.Fonts->AddFontFromFileTTF(
+		"C:/Windows/Fonts/meiryo.ttc",          // フォントファイル
+		18.0f,                                   // 文字の大きさ
+		nullptr,
+		io.Fonts->GetGlyphRangesJapanese());     // 日本語の文字を含める
+
 	io.Fonts->Build();
 #endif
 }
@@ -544,7 +553,7 @@ Microsoft::WRL::ComPtr<IDxcBlob> DirectXCommon::CompileShader(
 	shaderSourceBuffer.Size = shaderSource->GetBufferSize();
 	shaderSourceBuffer.Encoding = DXC_CP_UTF8;
 
-	// Compileする
+	// Compileする 
 	LPCWSTR arguments[] = {
 		filePath.c_str(),
 		L"-E", L"main",
@@ -613,7 +622,7 @@ DirectXCommon::CreateBufferResource(size_t sizeInBytes) {
 }
 
 // ===== テクスチャリソースの生成 =====
-Microsoft::WRL::ComPtr<ID3D12Resource> 
+Microsoft::WRL::ComPtr<ID3D12Resource>
 DirectXCommon::CreateTextureResource(const DirectX::TexMetadata& metadata) {
 	D3D12_RESOURCE_DESC resourceDesc{};
 	resourceDesc.Width = UINT(metadata.width);

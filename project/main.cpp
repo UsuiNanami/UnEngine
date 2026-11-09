@@ -1,3 +1,5 @@
+#define _USE_MATH_DEFINES
+#include <cmath>
 #include <Windows.h>    // Windows APIを使うためのヘッダ
 #include <cstdint>      // int32_tなどの整数型を使うためのヘッダ
 #include <string>       // std::string 文字列を扱うためのヘッダ
@@ -37,8 +39,11 @@
 #include "externals/imgui/imgui_impl_win32.h"
 #include "externals/imgui/imgui_impl_dx12.h"   // ImGuiのDirectX 12用の実装を使うためのヘッダ
 
+#include <assimp/Importer.hpp>
+#include <assimp/scene.h>
+#include <assimp/postprocess.h>
 
-// *libはヘッダには書いてはいけない！
+// *libはヘッダには書いてはいけない！ 
 #pragma comment(lib, "Dbghelp.lib")    // デバッグヘルプライブラリをリンクするための指示
 #pragma comment(lib, "dxguid.lib")     // DXGIのGUIDをリンクするための指示
 #pragma comment(lib, "dxcompiler.lib") // DirectX Shader Compilerをリンクするための指示
@@ -73,7 +78,7 @@ static LONG WINAPI ExportDump(EXCEPTION_POINTERS* exception) {
 
 // ==============================================
 // ログファイルを生成して書き込み用ストリームを返す関数 
-// ============================================== 
+// ============================================== 　  
 std::ofstream InitializeLogFile() {
 	std::filesystem::create_directory("logs");
 	std::chrono::system_clock::time_point now = std::chrono::system_clock::now();
@@ -106,10 +111,10 @@ struct ParticleForGPU {
 
 
 
-Transform transform{ {1.0f, 1.0f, 1.0f}, {0.0f, 0.0f, 0.0f}, {0.0f, 0.0f, 0.0f} };
-Transform cameraTransform{ {1.0f, 1.0f, 1.0f}, {0.0f, 0.0f, 0.0f}, {0.0f, 0.0f, -10.0f} }; // カメラのTransform
+Transform transform{ { 1.0f, 1.0f, 1.0f },{ 0.0f, 0.0f, 0.0f },{ 0.0f, 0.0f, 0.0f } };
+Transform cameraTransform{ { 1.0f, 1.0f, 1.0f },{ 0.0f, 0.0f, 0.0f },{ 0.0f, 0.0f, -10.0f } }; // カメラのTransform
 
-Transform transformSprite{ {1.0f, 1.0f, 1.0f}, {0.0f, 0.0f, 0.0f}, {0.0f, 0.0f, 0.0f} }; // Sprite用のTransform
+Transform transformSprite{ { 1.0f, 1.0f, 1.0f },{ 0.0f, 0.0f, 0.0f },{ 0.0f, 0.0f, 0.0f } }; // Sprite用のTransform
 
 // ====================================================
 // Particle構造体
@@ -119,7 +124,11 @@ struct Particle {
 	Vector3 velocity;    // 速度 (m/s)  
 	Vector4 color;      // 色 MakeNewParticle関数でランダムに決定する 
 	float lifeTime;    // 生存可能な時間 (秒)
-	float currentTime; // 発生してからの経過時間 (秒)　uvTransform
+	float currentTime; // 発生してからの経過時間 (秒)
+	Vector3 startPosition; // 中心の位置
+	Vector3 targetOffset;  // 中心から一番遠くまでのずれ
+	uint32_t shapeIndex; // どの形か（0〜4） MakeNewParticle
+	Vector3 angularVelocity; // 回転の速さ（ラジアン/秒） 
 };
 
 // Lighting方式の定義
@@ -148,7 +157,7 @@ struct TransformationMatrix {
 // DirectionalLight構造体の定義 
 struct DirectionalLight {
 	Vector4 color;      // ライトの色 
-	Vector3 direction;  // ライトの向き（単位ベクトル） Transform
+	Vector3 direction;  // ライトの向き（単位ベクトル）
 	float intensity;    // 輝度（明るさ） 
 };
 
@@ -215,18 +224,105 @@ struct MeshData {
 	D3D12_VERTEX_BUFFER_VIEW vertexBufferView{};
 };
 
+// ノード構造体  
+struct Node {
+	Matrix4x4 localMatrix;       // ノードのLocalMatrix（Transform）
+	std::string name;            // ノードの名前
+	std::vector<Node> children;  // 子供のノード 
+};
+
 // モデル全体の構造体（複数のメッシュをまとめる） 
 struct ModelData {
 	std::vector<MeshData> meshes;
+	Node rootNode;
 };
+
+Node ReadNode(aiNode* node) {
+	Node result;
+
+	aiMatrix4x4 aiLocalMatrix = node->mTransformation;
+	aiLocalMatrix.Transpose(); // assimpは列ベクトル形式なので、転置して行ベクトル形式にする
+	for (uint32_t row = 0; row < 4; ++row) {
+		for (uint32_t col = 0; col < 4; ++col) {
+			result.localMatrix.m[row][col] = aiLocalMatrix[row][col];
+		}
+	}
+
+	// 名前をコピーする
+	result.name = node->mName.C_Str();
+
+	//  子供を読む
+	result.children.resize(node->mNumChildren);
+	for (uint32_t childIndex = 0; childIndex < node->mNumChildren; ++childIndex) {
+		result.children[childIndex] = ReadNode(node->mChildren[childIndex]);
+	}
+
+	return result;
+}
 
 // ====================================================
 // OBJファイルを読み込む関数
 // ====================================================
-ModelData LoadObjFile(const std::string& directoryPath, const std::string& filename)
+ModelData LoadModelFile(const std::string& directoryPath, const std::string& filename)
 {
+
+	Assimp::Importer importer;
+	std::string filePath = directoryPath + "/" + filename;
+	const aiScene* scene = importer.ReadFile(filePath.c_str(), aiProcess_FlipWindingOrder | aiProcess_FlipUVs);
+	assert(scene->HasMeshes()); // メッシュがないのは対応しない
+
 	// 1. 必要な変数を宣言
-	ModelData modelData;              // 読み込んだ結果を格納する構造体 
+	ModelData modelData;              // 読み込んだ結果を格納する構造体  
+
+	for (uint32_t meshIndex = 0; meshIndex < scene->mNumMeshes; ++meshIndex) {
+		aiMesh* mesh = scene->mMeshes[meshIndex];
+		assert(mesh->HasNormals());        // 法線がないMeshは今回は非対応
+		assert(mesh->HasTextureCoords(0)); // TexcoordがないMeshは今回は非対応
+
+		// ここで MeshData を1つ用意する
+		MeshData currentMesh;
+
+		// ここにFaceループ
+		for (uint32_t faceIndex = 0; faceIndex < mesh->mNumFaces; ++faceIndex) {
+			aiFace& face = mesh->mFaces[faceIndex];
+			assert(face.mNumIndices == 3); // 三角形のみサポート
+
+			for (uint32_t element = 0; element < face.mNumIndices; ++element) {
+				uint32_t vertexIndex = face.mIndices[element];
+				aiVector3D& position = mesh->mVertices[vertexIndex];
+				aiVector3D& normal = mesh->mNormals[vertexIndex];
+				aiVector3D& texcoord = mesh->mTextureCoords[0][vertexIndex];
+
+				VertexData vertex;
+				vertex.position = { position.x, position.y, position.z, 1.0f };
+				vertex.normal = { normal.x, normal.y, normal.z };
+				vertex.texcoord = { texcoord.x, texcoord.y };
+
+				// aiProcess_MakeLeftHandedはz*=-1で、右手->左手に変換するので手動で対処 
+				vertex.position.x *= -1.0f;
+				vertex.normal.x *= -1.0f;
+
+				// 頂点を追加する 
+				currentMesh.vertices.push_back(vertex);
+			}
+		}
+
+		aiMaterial* material = scene->mMaterials[mesh->mMaterialIndex];
+		if (material->GetTextureCount(aiTextureType_DIFFUSE) != 0) {
+			aiString textureFilePath;
+			material->GetTexture(aiTextureType_DIFFUSE, 0, &textureFilePath);
+			// テクスチャのパスを保存する 
+			currentMesh.material.textureFilePath = directoryPath + "/" + textureFilePath.C_Str();
+		}
+
+		// 用意した MeshData を modelData.meshes に追加する    
+		modelData.meshes.push_back(currentMesh);
+
+	}
+	modelData.rootNode = ReadNode(scene->mRootNode);
+
+
+	/*
 	std::vector<Vector4> positions;   // v（位置）データ
 	std::vector<Vector3> normals;     // vn（法線）データ
 	std::vector<Vector2> texcoords;   // vt（テクスチャ座標）データ
@@ -265,7 +361,7 @@ ModelData LoadObjFile(const std::string& directoryPath, const std::string& filen
 		else if (identifier == "mtllib") { // mtlファイルの指定
 			std::string materialFilename;
 			s >> materialFilename;
-			// mtlファイルを解析してテクスチャパス等を取得 
+			// mtlファイルを解析してテクスチャパス等を取得
 			currentMesh.material = LoadMaterialTemplateFile(directoryPath, materialFilename);
 		}
 		else if (identifier == "usemtl") { // マテリアルの切り替え
@@ -318,6 +414,7 @@ ModelData LoadObjFile(const std::string& directoryPath, const std::string& filen
 	if (!currentMesh.vertices.empty()) {
 		modelData.meshes.push_back(currentMesh);
 	}
+	*/
 
 	return modelData;
 }
@@ -502,7 +599,7 @@ bool IsReleaseTriggerKey(uint8_t keyCode) {
 }
 
 enum BlendMode {
-	// 0: ブレンドなし
+	// 0: ブレンドなし　
 	kBlendModeNone,
 	// 1: 通常のαブレンド
 	kBlendModeNormal,
@@ -521,6 +618,27 @@ enum BlendMode {
 Microsoft::WRL::ComPtr<ID3D12PipelineState> graphicsPipelineStates[kCountOfBlendModes];
 
 
+// =========================
+// イージング関数
+// =========================　
+
+// 出現用：少し行き過ぎて戻る
+float EaseOutBack(float t) {
+	const float c1 = 1.70158f;
+	const float c3 = c1 + 1.0f;
+	return 1.0f + c3 * std::pow(t - 1.0f, 3.0f) + c1 * std::pow(t - 1.0f, 2.0f);
+}
+
+// 消滅用：ゆっくり始まって速く終わる
+float EaseInSine(float t) {
+	return 1.0f - std::cos(t * static_cast<float>(M_PI) / 2.0f);
+}
+
+// 位置用：速く飛び出して、ふわっと止まる　
+float EaseOutCubic(float t) {
+	return 1.0f - std::pow(1.0f - t, 3.0f);
+}
+
 // ===========================
 // パーティクル生成関数
 // ===========================
@@ -528,22 +646,47 @@ Particle MakeNewParticle(std::mt19937& randomEngine, const Vector3& translate) {
 	// 位置と速度を [-1, 1] でランダムに設定
 	std::uniform_real_distribution<float> distribution(-1.0f, 1.0f);
 	Particle particle;
-	particle.transform.scale = { 1.0f, 1.0f, 1.0f };
-	particle.transform.rotate = { 0.0f, 0.0f, 0.0f };
+	particle.transform.scale = { 0.5f, 0.5f, 0.5f };
+	// 最初の向きをランダムに（0〜360°）
+	std::uniform_real_distribution<float> distAngle(0.0f, 2.0f * static_cast<float>(M_PI));
+	particle.transform.rotate = { distAngle(randomEngine), distAngle(randomEngine), distAngle(randomEngine) };
+
+	// 回転の速さをランダムに（-3〜3 ラジアン/秒 ≒ 1秒で半回転くらい） 
+	std::uniform_real_distribution<float> distSpin(-3.0f, 3.0f);
+	particle.angularVelocity = { distSpin(randomEngine), distSpin(randomEngine), distSpin(randomEngine) };
+
 	//particle.transform.translate = { distribution(randomEngine), distribution(randomEngine), distribution(randomEngine) };
-	//particle.velocity = { distribution(randomEngine), distribution(randomEngine), distribution(randomEngine) };
-	// 基準位置 + ランダムなずれ
-	Vector3 randomTranslate{ distribution(randomEngine), distribution(randomEngine), distribution(randomEngine) };
-	particle.transform.translate = {
-		translate.x + randomTranslate.x,
-		translate.y + randomTranslate.y,
-		translate.z + randomTranslate.z };
+	particle.velocity = { distribution(randomEngine), distribution(randomEngine), distribution(randomEngine) };
+
+	// 中心（エミッターの位置）から生まれる
+	particle.startPosition = translate;
+	particle.transform.translate = translate;
+
+	// 飛んでいく方向をランダムに決める　if (isUpdate) {
+	Vector3 direction{ distribution(randomEngine), distribution(randomEngine), distribution(randomEngine) };
+	if (direction.x == 0.0f && direction.y == 0.0f && direction.z == 0.0f) {
+		direction = { 0.0f, 1.0f, 0.0f };
+	}
+	direction = MyMath::Normalize(direction);
+
+	// どこまで飛ぶか
+	std::uniform_real_distribution<float> distDistance(1.5f, 3.0f);
+	float distance = distDistance(randomEngine);
+
+	particle.targetOffset = {
+		direction.x * distance,
+		direction.y * distance,
+		direction.z * distance };
 
 	// 色をランダムに設定（0.0f ～ 1.0f）
 	std::uniform_real_distribution<float> distColor(0.0f, 1.0f);
 	particle.color = { distColor(randomEngine), distColor(randomEngine), distColor(randomEngine), 1.0f };
 
-	// 生存時間をランダムに設定（1秒 ～ 3秒）　
+	// 形をランダムに決める（0〜4）
+	std::uniform_int_distribution<uint32_t> distShape(0, 4);
+	particle.shapeIndex = distShape(randomEngine);
+
+	// 生存時間をランダムに設定（1秒 ～ 3秒）　 
 	std::uniform_real_distribution<float> distTime(1.0f, 3.0f);
 	particle.lifeTime = distTime(randomEngine);
 	particle.currentTime = 0.0f;
@@ -589,6 +732,29 @@ bool IsCollision(const AABB& aabb, const Vector3& point) {
 		(point.z >= aabb.min.z && point.z <= aabb.max.z);
 }
 
+// 点光源構造体
+struct PointLight {
+	Vector4 color;    // 点光源の色 
+	Vector3 position; // 点光源の位置
+	float intensity;  // 点光源の強度
+	float radius;        // 点光源の有効範囲
+	float decay;         // 減衰係数
+	float padding[2];    // パディング
+};
+
+// スポットライト構造体
+struct SpotLight {
+	Vector4 color;     // スポットライトの色
+	Vector3 position;  // スポットライトの位置
+	float intensity;   // スポットライトの強度
+	Vector3 direction; // スポットライトの方向
+	float distance;    // スポットライトの有効距離
+	float decay;       // 減衰係数
+	float cosAngle;    // スポットライトの角度（ラジアン）
+	float cosFalloffStart; // Falloff開始角度（ラジアンのcos)
+	float padding[2];  // パディング
+};
+
 // ====================================================
 // ---------- Windowsアプリのエントリーポイント ---------  
 // ====================================================
@@ -625,7 +791,7 @@ int WINAPI WinMain(_In_ HINSTANCE, _In_opt_ HINSTANCE, _In_ LPSTR, _In_ int) {
 	// ----- ログシステムの開始 -----  
 	std::ofstream logFile = InitializeLogFile();
 
-	// DirectXの初期化
+	// DirectXの初期化　
 	dxCommon = new DirectXCommon();
 	dxCommon->Initialize(winApp);
 
@@ -655,6 +821,9 @@ int WINAPI WinMain(_In_ HINSTANCE, _In_opt_ HINSTANCE, _In_ LPSTR, _In_ int) {
 	// フィールド有効化フラグ
 	bool useAccelerationField = true;
 
+	// 自動発生するか　
+	bool useAutoEmit = false;
+
 	// ----- RootSignature の生成 -----　
 	HRESULT hr;
 	D3D12_ROOT_SIGNATURE_DESC descriptionRootSignature{};
@@ -669,7 +838,7 @@ int WINAPI WinMain(_In_ HINSTANCE, _In_opt_ HINSTANCE, _In_ LPSTR, _In_ int) {
 	descriptorRange[0].OffsetInDescriptorsFromTableStart = D3D12_DESCRIPTOR_RANGE_OFFSET_APPEND;
 
 	// RootParameter作成 
-	D3D12_ROOT_PARAMETER rootParameters[5] = {};
+	D3D12_ROOT_PARAMETER rootParameters[7] = {};
 	rootParameters[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_CBV;
 	rootParameters[0].ShaderVisibility = D3D12_SHADER_VISIBILITY_VERTEX;
 	rootParameters[0].Descriptor.ShaderRegister = 0;
@@ -696,6 +865,16 @@ int WINAPI WinMain(_In_ HINSTANCE, _In_opt_ HINSTANCE, _In_ LPSTR, _In_ int) {
 	rootParameters[4].ParameterType = D3D12_ROOT_PARAMETER_TYPE_CBV;
 	rootParameters[4].ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
 	rootParameters[4].Descriptor.ShaderRegister = 2;
+
+	// PointLight用 (b3)
+	rootParameters[5].ParameterType = D3D12_ROOT_PARAMETER_TYPE_CBV;
+	rootParameters[5].ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
+	rootParameters[5].Descriptor.ShaderRegister = 3;
+
+	// SpotLight用 (b4)
+	rootParameters[6].ParameterType = D3D12_ROOT_PARAMETER_TYPE_CBV;
+	rootParameters[6].ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
+	rootParameters[6].Descriptor.ShaderRegister = 4;
 
 	// StaticSamplerの設定  
 	D3D12_STATIC_SAMPLER_DESC staticSamplers[1] = {};
@@ -988,27 +1167,38 @@ int WINAPI WinMain(_In_ HINSTANCE, _In_opt_ HINSTANCE, _In_ LPSTR, _In_ int) {
 	// ===================================================== 
 	// VertexResourceの生成 
 	// =====================================================
-	// objファイルの読み込み
-	// --- fenceモデルデータの読み込み --- LoadObjFile
-	//ModelData fenceModel = LoadObjFile("resources", "fence.obj");
 	// 四角形(Primitive)をコード上で構築する
-	ModelData fenceModel;
+	/*ModelData fenceModel;
 	{
 		MeshData quad;
-		// 左上, 右上, 左下 / 左下, 右上, 右下（時計回り＝表） 
-		quad.vertices.push_back({ {-1.0f,  1.0f, 0.0f, 1.0f}, {0.0f, 0.0f}, {0.0f, 0.0f, -1.0f} });
-		quad.vertices.push_back({ { 1.0f,  1.0f, 0.0f, 1.0f}, {1.0f, 0.0f}, {0.0f, 0.0f, -1.0f} });
-		quad.vertices.push_back({ {-1.0f, -1.0f, 0.0f, 1.0f}, {0.0f, 1.0f}, {0.0f, 0.0f, -1.0f} });
-		quad.vertices.push_back({ {-1.0f, -1.0f, 0.0f, 1.0f}, {0.0f, 1.0f}, {0.0f, 0.0f, -1.0f} });
-		quad.vertices.push_back({ { 1.0f,  1.0f, 0.0f, 1.0f}, {1.0f, 0.0f}, {0.0f, 0.0f, -1.0f} });
-		quad.vertices.push_back({ { 1.0f, -1.0f, 0.0f, 1.0f}, {1.0f, 1.0f}, {0.0f, 0.0f, -1.0f} });
+		// 左上, 右上, 左下 / 左下, 右上, 右下（時計回り＝表）
+		quad.vertices.push_back({ { -1.0f,  1.0f, 0.0f, 1.0f },{ 0.0f, 0.0f },{ 0.0f, 0.0f, -1.0f } });
+		quad.vertices.push_back({ { 1.0f,  1.0f, 0.0f, 1.0f },{ 1.0f, 0.0f },{ 0.0f, 0.0f, -1.0f } });
+		quad.vertices.push_back({ { -1.0f, -1.0f, 0.0f, 1.0f },{ 0.0f, 1.0f },{ 0.0f, 0.0f, -1.0f } });
+		quad.vertices.push_back({ { -1.0f, -1.0f, 0.0f, 1.0f },{ 0.0f, 1.0f },{ 0.0f, 0.0f, -1.0f } });
+		quad.vertices.push_back({ { 1.0f,  1.0f, 0.0f, 1.0f },{ 1.0f, 0.0f },{ 0.0f, 0.0f, -1.0f } });
+		quad.vertices.push_back({ { 1.0f, -1.0f, 0.0f, 1.0f },{ 1.0f, 1.0f },{ 0.0f, 0.0f, -1.0f } });
 		quad.material.textureFilePath = "Resources/circle.png";
 		fenceModel.meshes.push_back(quad);
 	}
+	*/
+
+	// パーティクル（5種類） 
+	const uint32_t kNumShapes = 5;
+	ModelData particleModels[kNumShapes];
+	for (uint32_t i = 0; i < kNumShapes; ++i) {
+		std::string name = "Particle" + std::to_string(i + 1);   // "Particle1"〜"Particle5"
+		particleModels[i] = LoadModelFile("Resources/" + name, name + ".obj");
+
+		// テクスチャは全部同じ
+		for (auto& mesh : particleModels[i].meshes) {
+			mesh.material.textureFilePath = "Resources/Particle.png";
+		}
+	}
 
 	// ====================================================
-    // 球(Sphere)の頂点バッファ・インデックスバッファ
-    // ====================================================
+	// 球(Sphere)の頂点バッファ・インデックスバッファ
+	// ====================================================
 	const uint32_t kSubdivision = 16; // 球の分割数
 	const uint32_t kSphereVertexCount = (kSubdivision + 1) * (kSubdivision + 1);
 	const uint32_t kSphereIndexCount = kSubdivision * kSubdivision * 6;
@@ -1028,21 +1218,13 @@ int WINAPI WinMain(_In_ HINSTANCE, _In_opt_ HINSTANCE, _In_ LPSTR, _In_ int) {
 	CreateSphereVertices(sphere, sphereVertexData, kSubdivision);
 	sphereVertexResource->Unmap(0, nullptr);
 
-	// --- インデックスバッファ ---
-	Microsoft::WRL::ComPtr<ID3D12Resource> sphereIndexResource =
-		dxCommon->CreateBufferResource(sizeof(uint32_t) * kSphereIndexCount);
+	// ====================================================
+	// フィールド
+	// ====================================================
+	// ModelData terrainModel = LoadModelFile("resources/terrain", "terrain.obj");
+	ModelData terrainModel = LoadModelFile("resources", "plane.gltf");
 
-	D3D12_INDEX_BUFFER_VIEW sphereIndexBufferView{};
-	sphereIndexBufferView.BufferLocation = sphereIndexResource->GetGPUVirtualAddress();
-	sphereIndexBufferView.SizeInBytes = UINT(sizeof(uint32_t) * kSphereIndexCount);
-	sphereIndexBufferView.Format = DXGI_FORMAT_R32_UINT;
-
-	uint32_t* sphereIndexData = nullptr;
-	sphereIndexResource->Map(0, nullptr, reinterpret_cast<void**>(&sphereIndexData));
-	CreateSphereIndices(sphereIndexData, kSubdivision);
-	sphereIndexResource->Unmap(0, nullptr);
-
-	for (auto& mesh : fenceModel.meshes) {
+	for (auto& mesh : terrainModel.meshes) {
 		mesh.vertexResource = dxCommon->CreateBufferResource(sizeof(VertexData) * mesh.vertices.size());
 
 		mesh.vertexBufferView.BufferLocation = mesh.vertexResource->GetGPUVirtualAddress();
@@ -1055,7 +1237,38 @@ int WINAPI WinMain(_In_ HINSTANCE, _In_opt_ HINSTANCE, _In_ LPSTR, _In_ int) {
 		mesh.vertexResource->Unmap(0, nullptr);
 	}
 
-	// fence用マテリアル
+	// --- インデックスバッファ ---
+	Microsoft::WRL::ComPtr<ID3D12Resource> sphereIndexResource =
+		dxCommon->CreateBufferResource(sizeof(uint32_t) * kSphereIndexCount);
+
+	D3D12_INDEX_BUFFER_VIEW sphereIndexBufferView{};
+	sphereIndexBufferView.BufferLocation = sphereIndexResource->GetGPUVirtualAddress();
+	sphereIndexBufferView.SizeInBytes = UINT(sizeof(uint32_t) * kSphereIndexCount);
+	sphereIndexBufferView.Format = DXGI_FORMAT_R32_UINT;
+
+	// インデックスバッファにデータ転送 
+	uint32_t* sphereIndexData = nullptr;
+	sphereIndexResource->Map(0, nullptr, reinterpret_cast<void**>(&sphereIndexData));
+	CreateSphereIndices(sphereIndexData, kSubdivision);
+	sphereIndexResource->Unmap(0, nullptr);
+
+	// パーティクルの形（5種類）の頂点バッファを作る
+	for (auto& model : particleModels) {
+		for (auto& mesh : model.meshes) {
+			mesh.vertexResource = dxCommon->CreateBufferResource(sizeof(VertexData) * mesh.vertices.size());
+
+			mesh.vertexBufferView.BufferLocation = mesh.vertexResource->GetGPUVirtualAddress();
+			mesh.vertexBufferView.SizeInBytes = UINT(sizeof(VertexData) * mesh.vertices.size());
+			mesh.vertexBufferView.StrideInBytes = sizeof(VertexData);
+
+			VertexData* mappedData = nullptr;
+			mesh.vertexResource->Map(0, nullptr, reinterpret_cast<void**>(&mappedData));
+			std::memcpy(mappedData, mesh.vertices.data(), sizeof(VertexData) * mesh.vertices.size());
+			mesh.vertexResource->Unmap(0, nullptr);
+		}
+	}
+
+	// Obj用マテリアル
 	Microsoft::WRL::ComPtr<ID3D12Resource> materialResourceFence =
 		dxCommon->CreateBufferResource(sizeof(Material));
 
@@ -1067,8 +1280,19 @@ int WINAPI WinMain(_In_ HINSTANCE, _In_opt_ HINSTANCE, _In_ LPSTR, _In_ int) {
 	materialDataFence->shininess = 50.0f;                                // 光沢度
 	materialResourceFence->Unmap(0, nullptr);
 
+	// パーティクル用マテリアル
+	Microsoft::WRL::ComPtr<ID3D12Resource> materialResourceParticle =
+		dxCommon->CreateBufferResource(sizeof(Material));
+
+	Material* materialDataParticle = nullptr;
+	materialResourceParticle->Map(0, nullptr, reinterpret_cast<void**>(&materialDataParticle));
+	materialDataParticle->color = { 1.0f, 1.0f, 1.0f, 1.0f };   // 白（＝色を変えない）
+	materialDataParticle->lightingType = Lighting_None;         // パーティクルはライティングしない
+	materialDataParticle->uvTransform = MyMath::Identity();
+
+
 	// フェンス用のTransform変数とWVPリソース
-	Transform fenceTransform = { {1.0f, 1.0f, 1.0f}, {0.0f, 0.0f, 0.0f}, {0.0f, 0.0f, 0.0f} };
+	Transform fenceTransform = { { 1.0f, 1.0f, 1.0f },{ 0.0f, 0.0f, 0.0f },{ 0.0f, 0.0f, 0.0f } };
 
 	Microsoft::WRL::ComPtr<ID3D12Resource> fenceWvpResource = dxCommon->CreateBufferResource(sizeof(TransformationMatrix));
 	TransformationMatrix* fenceWvpData = nullptr;
@@ -1077,6 +1301,29 @@ int WINAPI WinMain(_In_ HINSTANCE, _In_opt_ HINSTANCE, _In_ LPSTR, _In_ int) {
 	fenceWvpData->World = MyMath::Identity();
 	fenceWvpData->WorldInverseTranspose = MyMath::Identity();
 
+	// フィールド用マテリアル
+	Microsoft::WRL::ComPtr<ID3D12Resource> materialResourceTerrain =
+		dxCommon->CreateBufferResource(sizeof(Material));
+
+	Material* materialDataTerrain = nullptr;
+	materialResourceTerrain->Map(0, nullptr, reinterpret_cast<void**>(&materialDataTerrain));
+	materialDataTerrain->color = { 1.0f, 1.0f, 1.0f, 1.0f };
+	materialDataTerrain->lightingType = Lighting_Lambert;   // 下の補足を参照
+	materialDataTerrain->uvTransform = MyMath::Identity();
+	materialDataTerrain->shininess = 50.0f;
+	materialResourceTerrain->Unmap(0, nullptr);
+
+	// フィールド用のTransform変数とWVPリソース
+	Transform terrainTransform = { { 1.0f, 1.0f, 1.0f },{ 0.0f, 0.0f, 0.0f },{ 0.0f, 0.0f, 0.0f } };
+
+	Microsoft::WRL::ComPtr<ID3D12Resource> terrainWvpResource =
+		dxCommon->CreateBufferResource(sizeof(TransformationMatrix));
+	TransformationMatrix* terrainWvpData = nullptr;
+	terrainWvpResource->Map(0, nullptr, reinterpret_cast<void**>(&terrainWvpData));
+	terrainWvpData->WVP = MyMath::Identity();
+	terrainWvpData->World = MyMath::Identity();
+	terrainWvpData->WorldInverseTranspose = MyMath::Identity();
+
 
 	// --- 平行光源用 ---  　 
 	Microsoft::WRL::ComPtr<ID3D12Resource> directionalLightResource =
@@ -1084,10 +1331,45 @@ int WINAPI WinMain(_In_ HINSTANCE, _In_opt_ HINSTANCE, _In_ LPSTR, _In_ int) {
 	DirectionalLight* directionalLightData = nullptr;
 	directionalLightResource->Map(0, nullptr, reinterpret_cast<void**>(&directionalLightData));
 
-	// 初期値
+	// --- 点光源用 ---
+	Microsoft::WRL::ComPtr<ID3D12Resource> pointLightResource =
+		dxCommon->CreateBufferResource(sizeof(PointLight));
+	PointLight* pointLightData = nullptr;
+	pointLightResource->Map(0, nullptr, reinterpret_cast<void**>(&pointLightData));
+
+	// --- スポットライト用 ---
+	Microsoft::WRL::ComPtr<ID3D12Resource> spotLightResource =
+		dxCommon->CreateBufferResource(sizeof(SpotLight));
+	SpotLight* spotLightData = nullptr;
+	spotLightResource->Map(0, nullptr, reinterpret_cast<void**>(&spotLightData));
+
+	// スポットライトの初期値設定
+	spotLightData->color = { 1.0f, 1.0f, 1.0f, 1.0f };
+	spotLightData->position = { 2.0f, 1.25f, 0.0f };
+	spotLightData->distance = 7.0f;
+	spotLightData->direction = MyMath::Normalize({ -1.0f, -1.0f, 0.0f });
+	spotLightData->intensity = 4.0f;
+	spotLightData->decay = 2.0f;
+	spotLightData->cosAngle = std::cos(static_cast<float>(M_PI) / 3.0f);
+	spotLightData->cosFalloffStart = std::cos(static_cast<float>(M_PI) / 6.0f);
+	// 角度の初期値
+	static float spotAngle = static_cast<float>(M_PI) / 3.0f;
+	static float falloffStartAngle = static_cast<float>(M_PI) / 6.0f;
+	spotLightData->cosAngle = std::cos(spotAngle);
+	spotLightData->cosFalloffStart = std::cos(falloffStartAngle);
+
+	// 平行光源の初期値設定 
 	directionalLightData->color = { 1.0f,1.0f,1.0f,1.0f };
 	directionalLightData->direction = MyMath::Normalize({ 0.0f, -1.0f, 0.0f });
 	directionalLightData->intensity = 1.0f;
+
+	// 点光源の初期値設定 
+	pointLightData->color = { 1.0f, 1.0f, 1.0f, 1.0f };
+	pointLightData->position = { 0.0f, 2.0f, 0.0f };
+	pointLightData->intensity = 1.0f;
+	pointLightData->radius = 10.0f;
+	pointLightData->decay = 2.0f;
+
 
 	// --- カメラ用 ---
 	Microsoft::WRL::ComPtr<ID3D12Resource> cameraResource =
@@ -1106,7 +1388,7 @@ int WINAPI WinMain(_In_ HINSTANCE, _In_opt_ HINSTANCE, _In_ LPSTR, _In_ int) {
 
 	// ----- テクスチャを呼んで転送する -----  
 	// 1枚目
-	DirectX::ScratchImage mipImages = DirectXCommon::LoadTexture(fenceModel.meshes[0].material.textureFilePath);
+	DirectX::ScratchImage mipImages = DirectXCommon::LoadTexture("Resources/Particle.png");
 	const DirectX::TexMetadata& metadata = mipImages.GetMetadata();
 	Microsoft::WRL::ComPtr<ID3D12Resource> textureResource =
 		dxCommon->CreateTextureResource(metadata);
@@ -1134,21 +1416,21 @@ int WINAPI WinMain(_In_ HINSTANCE, _In_opt_ HINSTANCE, _In_ LPSTR, _In_ int) {
 	// ====================================================
 	// Instancing用 Resource / SRV 
 	// ====================================================
-	const uint32_t kNumMaxInstances = 10; // 最大インスタンス数 
+	const uint32_t kNumMaxInstances = 100; // 最大インスタンス数 
 
-	// TransformationMatrix を kNumInstances 個分格納できる
+	// TransformationMatrix を kNumInstances 個分格納できる 
 	Microsoft::WRL::ComPtr<ID3D12Resource> instancingResource =
-		dxCommon->CreateBufferResource(sizeof(ParticleForGPU) * kNumMaxInstances); // ParticleForGPU は GPU側で使う構造体
+		dxCommon->CreateBufferResource(sizeof(ParticleForGPU) * kNumMaxInstances * kNumShapes);
 
 	ParticleForGPU* instancingData = nullptr;
 	instancingResource->Map(0, nullptr, reinterpret_cast<void**>(&instancingData));
-	for (uint32_t index = 0; index < kNumMaxInstances; ++index) {
+	for (uint32_t index = 0; index < kNumMaxInstances * kNumShapes; ++index) {
 		instancingData[index].WVP = MyMath::Identity();
 		instancingData[index].World = MyMath::Identity();
 		instancingData[index].color = { 1.0f, 1.0f, 1.0f, 1.0f };
 	}
 
-	// StructuredBuffer 用の SRV (SRVヒープの index 3)    
+	// StructuredBuffer 用の SRV (SRVヒープの index 3)
 	D3D12_SHADER_RESOURCE_VIEW_DESC instancingSrvDesc{};
 	instancingSrvDesc.Format = DXGI_FORMAT_UNKNOWN;
 	instancingSrvDesc.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
@@ -1157,6 +1439,18 @@ int WINAPI WinMain(_In_ HINSTANCE, _In_opt_ HINSTANCE, _In_ LPSTR, _In_ int) {
 	instancingSrvDesc.Buffer.Flags = D3D12_BUFFER_SRV_FLAG_NONE;
 	instancingSrvDesc.Buffer.NumElements = kNumMaxInstances;
 	instancingSrvDesc.Buffer.StructureByteStride = sizeof(ParticleForGPU);
+
+	// 形ごとの SRV（SRVヒープの index 5〜9）
+	D3D12_GPU_DESCRIPTOR_HANDLE shapeSrvHandleGPU[kNumShapes];
+	for (uint32_t i = 0; i < kNumShapes; ++i) {
+		D3D12_SHADER_RESOURCE_VIEW_DESC desc = instancingSrvDesc; 
+		desc.Buffer.FirstElement = i * kNumMaxInstances;        
+		desc.Buffer.NumElements = kNumMaxInstances;
+
+		D3D12_CPU_DESCRIPTOR_HANDLE cpuHandle = dxCommon->GetSRVCPUDescriptorHandle(5 + i);
+		shapeSrvHandleGPU[i] = dxCommon->GetSRVGPUDescriptorHandle(5 + i);
+		device->CreateShaderResourceView(instancingResource.Get(), &desc, cpuHandle);
+	}
 
 
 	D3D12_CPU_DESCRIPTOR_HANDLE instancingSrvHandleCPU = dxCommon->GetSRVCPUDescriptorHandle(3);
@@ -1178,15 +1472,15 @@ int WINAPI WinMain(_In_ HINSTANCE, _In_opt_ HINSTANCE, _In_ LPSTR, _In_ int) {
 	// ====================================================
 	// Particleの初期化
 	// ====================================================　 
-	//Particle particles[kNumMaxInstances];
+	//Particle particles[kNumMaxInstances]; 
 	//for (uint32_t index = 0; index < kNumMaxInstances; ++index) {
-	//	particles[index] = MakeNewParticle(randomEngine);
+	//	particles[index] = MakeNewParticle(randomEngine);　Vector3 randomTranslate
 	//}
 
 	Emitter emitter{};             // Emitter構造体の初期化
 	emitter.count = 3;             // 1フレームで生成するパーティクルの数 
 	emitter.frequency = 0.5f;      // 0.5秒ごとに発生 
-	emitter.frequencyTime = 0.0f;  // 頻度用の時刻。0で初期化 
+	emitter.frequencyTime = 0.0f;  // 頻度用の時刻。0で初期化  
 	emitter.transform.translate = { 0.0f, 0.0f, 0.0f };
 	emitter.transform.rotate = { 0.0f, 0.0f, 0.0f };
 	emitter.transform.scale = { 1.0f, 1.0f, 1.0f };
@@ -1199,9 +1493,9 @@ int WINAPI WinMain(_In_ HINSTANCE, _In_opt_ HINSTANCE, _In_ LPSTR, _In_ int) {
 
 	// listで管理する場合
 	std::list<Particle> particles;
-	for (uint32_t index = 0; index < kNumMaxInstances; ++index) {
-		particles.push_back(MakeNewParticle(randomEngine, emitter.transform.translate));
-	}
+	//for (uint32_t index = 0; index < kNumMaxInstances; ++index) { 
+	//	particles.push_back(MakeNewParticle(randomEngine, emitter.transform.translate));
+	//}
 
 	// ２枚目のSRV設定  　
 	D3D12_SHADER_RESOURCE_VIEW_DESC srvDesc2{};
@@ -1217,7 +1511,24 @@ int WINAPI WinMain(_In_ HINSTANCE, _In_opt_ HINSTANCE, _In_ LPSTR, _In_ int) {
 	// SRVを生成 
 	device->CreateShaderResourceView(textureResource2.Get(), &srvDesc2, textureSrvHandleCPU2);
 
-	// 切り替え用 
+	// ----- フィールド用テクスチャ(3枚目)-----
+	DirectX::ScratchImage mipImages3 = DirectXCommon::LoadTexture(terrainModel.meshes[0].material.textureFilePath);
+	const DirectX::TexMetadata& metadata3 = mipImages3.GetMetadata();
+	Microsoft::WRL::ComPtr<ID3D12Resource> textureResource3 =
+		dxCommon->CreateTextureResource(metadata3);
+	ID3D12Resource* intermediateResource3 = dxCommon->UploadTextureData(textureResource3.Get(), mipImages3);
+
+	D3D12_SHADER_RESOURCE_VIEW_DESC srvDesc3{};
+	srvDesc3.Format = metadata3.format;
+	srvDesc3.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+	srvDesc3.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+	srvDesc3.Texture2D.MipLevels = UINT(metadata3.mipLevels);
+
+	D3D12_CPU_DESCRIPTOR_HANDLE textureSrvHandleCPU3 = dxCommon->GetSRVCPUDescriptorHandle(4);
+	D3D12_GPU_DESCRIPTOR_HANDLE textureSrvHandleGPU3 = dxCommon->GetSRVGPUDescriptorHandle(4);
+	device->CreateShaderResourceView(textureResource3.Get(), &srvDesc3, textureSrvHandleCPU3);
+
+	// 切り替え用 　
 	bool useMonsterBall = true;
 
 	// コマンドリストをクローズ 
@@ -1237,6 +1548,7 @@ int WINAPI WinMain(_In_ HINSTANCE, _In_opt_ HINSTANCE, _In_ LPSTR, _In_ int) {
 		WaitForSingleObject(dxCommon->GetFenceEvent(), INFINITE);
 	}
 
+
 	// メインループで使えるようにコマンドリストとアロケータをリセットする
 	hr = dxCommon->GetCommandAllocator()->Reset();
 	assert(SUCCEEDED(hr));
@@ -1246,6 +1558,7 @@ int WINAPI WinMain(_In_ HINSTANCE, _In_opt_ HINSTANCE, _In_ LPSTR, _In_ int) {
 	// 一時転送バッファの解放
 	intermediateResource->Release();
 	intermediateResource2->Release();
+	intermediateResource3->Release();
 
 
 	// ============================================
@@ -1273,6 +1586,18 @@ int WINAPI WinMain(_In_ HINSTANCE, _In_opt_ HINSTANCE, _In_ LPSTR, _In_ int) {
 		// 入力の更新
 		input->Update();
 
+		// ---------- マウス ----------
+		// 左クリックの「押した瞬間」を判定する
+		static bool preMouseLeft = false;
+		bool mouseLeft = (GetAsyncKeyState(VK_LBUTTON) & 0x8000) != 0; // 今押されているか
+		bool mouseTrigger = mouseLeft && !preMouseLeft;                 // 今押されていて、前は押されていない
+		preMouseLeft = mouseLeft;
+
+		// マウスの位置（ウィンドウの左上が(0,0)のピクセル座標）
+		POINT mousePos;
+		GetCursorPos(&mousePos);                       // 画面全体での位置
+		ScreenToClient(winApp->GetHwnd(), &mousePos);  // ウィンドウの中での位置に変換
+
 		// PushKey から TriggerKey に変更
 		if (input->TriggerKey(DIK_0))
 		{
@@ -1284,14 +1609,14 @@ int WINAPI WinMain(_In_ HINSTANCE, _In_opt_ HINSTANCE, _In_ LPSTR, _In_ int) {
 		ImGui_ImplWin32_NewFrame();
 		ImGui::NewFrame();
 
-		ImGui::Begin("Input Test");
+		ImGui::Begin("入力テスト");
 
 		// PushKey（押しっぱなし判定）の確認
 		if (input->PushKey(DIK_0)) {
-			ImGui::Text("Key 0 (Push): PUSHED!");
+			ImGui::Text("0キー : ON");
 		}
 		else {
-			ImGui::Text("Key 0 (Push): OFF");
+			ImGui::Text("0キー : OFF");
 		}
 
 		// 2. TriggerKey（押した瞬間判定）の確認（回数をカウント）
@@ -1299,14 +1624,15 @@ int WINAPI WinMain(_In_ HINSTANCE, _In_opt_ HINSTANCE, _In_ LPSTR, _In_ int) {
 		if (input->TriggerKey(DIK_0)) {
 			hitCount++; // 押された瞬間だけ +1 される
 		}
-		ImGui::Text("Key 0 (Trigger Count): %d", hitCount);
+		ImGui::Text("0キー 押された回数: %d", hitCount);
 
 		ImGui::End();
 
 		// ---------------------------------
 		// ライト共通設定
 		// ---------------------------------
-		ImGui::SeparatorText("Light");
+		// --- 平行光源設定 ---
+		ImGui::SeparatorText("平行光源設定");
 		// ライトの色
 		static float lightColor[4] = {
 			directionalLightData->color.x,
@@ -1314,15 +1640,15 @@ int WINAPI WinMain(_In_ HINSTANCE, _In_opt_ HINSTANCE, _In_ LPSTR, _In_ int) {
 			directionalLightData->color.z,
 			directionalLightData->color.w
 		};
-		if (ImGui::ColorEdit4("Light Color", lightColor)) {
+		if (ImGui::ColorEdit4("ライトの色##平行", lightColor)) {
 			directionalLightData->color.x = lightColor[0];
 			directionalLightData->color.y = lightColor[1];
 			directionalLightData->color.z = lightColor[2];
 			directionalLightData->color.w = lightColor[3];
 		}
 
-		// ライトの向き  
-		if (ImGui::SliderFloat3("Light Direction", &directionalLightData->direction.x, -1.0f, 1.0f)) {
+		// ライトの方向 
+		if (ImGui::SliderFloat3("ライトの方向##平行", &directionalLightData->direction.x, -1.0f, 1.0f)) {
 			Vector3& d = directionalLightData->direction;
 			float lengthSq = d.x * d.x + d.y * d.y + d.z * d.z;
 			if (lengthSq > 0.0001f) {
@@ -1332,72 +1658,96 @@ int WINAPI WinMain(_In_ HINSTANCE, _In_opt_ HINSTANCE, _In_ LPSTR, _In_ int) {
 				d = { 0.0f, -1.0f, 0.0f }; // 0のときは初期の向きに戻す
 			}
 		}
+		ImGui::SliderFloat("ライトの強度##平行", &directionalLightData->intensity, 0.0f, 5.0f);
 
-		// 光の強さ  
-		ImGui::SliderFloat("Intensity", &directionalLightData->intensity, 0.0f, 5.0f);
+		// --- 点光源 ---
+		ImGui::SeparatorText("点光源設定");
+		ImGui::ColorEdit4("ライトの色##点", &pointLightData->color.x);
+		ImGui::DragFloat3("ライトの位置##点", &pointLightData->position.x, 0.1f);
+		ImGui::SliderFloat("ライトの強度##点", &pointLightData->intensity, 0.0f, 5.0f);
+
+		// --- スポットライト ---　
+		ImGui::SeparatorText("スポットライト");
+		ImGui::ColorEdit4("ライトの色##スポット", &spotLightData->color.x);
+		ImGui::DragFloat3("ライトの位置##スポット", &spotLightData->position.x, 0.1f);
+		ImGui::SliderFloat("ライトの強度##スポット", &spotLightData->intensity, 0.0f, 5.0f);
+
+		// 角度調整用スライダー
+		bool angleChanged = false;
+		angleChanged |= ImGui::SliderAngle("照射角度", &spotAngle, 0.0f, 89.0f);
+		angleChanged |= ImGui::SliderAngle("減衰開始角度", &falloffStartAngle, 0.0f, 89.0f);
+		// 角度の制限
+		if (falloffStartAngle >= spotAngle) {
+			falloffStartAngle = spotAngle - 0.001f;
+		}
+		// cos値を計算してGPU用データに書き込む
+		if (angleChanged) {
+			spotLightData->cosAngle = std::cos(spotAngle);
+			spotLightData->cosFalloffStart = std::cos(falloffStartAngle);
+		}
 
 		// ---------------------------------
-		// デバックカメラ切り替え
-		// ---------------------------------　
-		ImGui::SeparatorText("Camera");
-		ImGui::Checkbox("Use Debug Camera", &useDebugCamera);
+		// デバックカメラ切り替え 
+		// ---------------------------------　　particle.velocity
+		ImGui::SeparatorText("カメラ");
+		ImGui::Checkbox("デバッグカメラを使う", &useDebugCamera);
 
-		ImGui::SliderFloat3("CameraTranslate", &cameraTransform.translate.x, -20.0f, 20.0f);
-		ImGui::SliderAngle("CameraRotateX", &cameraTransform.rotate.x);
-		ImGui::SliderAngle("CameraRotateY", &cameraTransform.rotate.y);
-		ImGui::SliderAngle("CameraRotateZ", &cameraTransform.rotate.z);
+		ImGui::SliderFloat3("位置##カメラ", &cameraTransform.translate.x, -20.0f, 20.0f);
+		ImGui::SliderAngle("回転X##カメラ", &cameraTransform.rotate.x);
+		ImGui::SliderAngle("回転Y##カメラ", &cameraTransform.rotate.y);
+		ImGui::SliderAngle("回転Z##カメラ", &cameraTransform.rotate.z);
 
 
 		// =====================================
-		// 球とパーティクルの設定
-		// ===================================== 
-		ImGui::Begin("Particle Settings");
-		ImGui::SeparatorText("Sphere Transform");
-		ImGui::DragFloat3("Sphere Position", &fenceTransform.translate.x, 0.1f);
-		ImGui::SliderAngle("Sphere Rotate X", &fenceTransform.rotate.x);
-		ImGui::SliderAngle("Sphere Rotate Y", &fenceTransform.rotate.y);
-		ImGui::SliderAngle("Sphere Rotate Z", &fenceTransform.rotate.z);
-		ImGui::DragFloat3("Sphere Scale", &fenceTransform.scale.x, 0.1f, 0.01f, 10.0f);
-		ImGui::DragFloat3("EmitterTranslate", &emitter.transform.translate.x, 0.01f, -100.0f, 100.0f);
+		// パーティクルの設定
+		// ===================================== 　
+		ImGui::Begin("パーティクル設定");
+		//ImGui::SeparatorText("球	");
+		//ImGui::ColorEdit4("色##球", &materialDataFence->color.x);
+		//ImGui::DragFloat3("位置##球", &fenceTransform.translate.x, 0.1f);
+		//ImGui::SliderAngle("回転X##球", &fenceTransform.rotate.x);
+		//ImGui::SliderAngle("回転Y##球", &fenceTransform.rotate.y);
+		//ImGui::SliderAngle("回転Z##球", &fenceTransform.rotate.z);
+		//ImGui::DragFloat3("サイズ", &fenceTransform.scale.x, 0.1f, 0.01f, 10.0f);
 
-		// Particleをリスタート 
-		//if (ImGui::Button("Restart Particles")) {
-		//	for (uint32_t index = 0; index < kNumMaxInstances; ++index) {
-		//		particles[index] = MakeNewParticle(randomEngine);
-		//	}
-		//}
+		ImGui::SeparatorText("パーティクル");
+		// マテリアルカラー調整（任意）　 
+		ImGui::Text("操作説明");
+		ImGui::Text("左クリック：クリックした場所にパーティクルを発生");
+		ImGui::ColorEdit4("色##パーティクル", &materialDataParticle->color.x);
 		// listで管理する場合
-		if (ImGui::Button("Restart Particles")) {
+		if (ImGui::Button("リスタート")) {
 			particles.clear();
 			for (uint32_t index = 0; index < kNumMaxInstances; ++index) {
 				particles.push_back(MakeNewParticle(randomEngine, emitter.transform.translate));
 			}
 		}
-		// Particleを追加する 
-		if (ImGui::Button("Add Particle")) {
+		// Particleを追加する 　
+		if (ImGui::Button("パーティクル追加")) {
 			particles.splice(particles.end(), Emit(emitter, randomEngine));
 		}
 
 		// Billboard切り替え
-		ImGui::Checkbox("useBillboard", &useBillboard);
-		ImGui::Checkbox("update", &isUpdate);
+		ImGui::Checkbox("ビルボード", &useBillboard);
+		ImGui::Checkbox("自動発生", &useAutoEmit);
+		ImGui::DragFloat3("エミッターの位置", &emitter.transform.translate.x, 0.01f, -100.0f, 100.0f);
+		ImGui::Checkbox("再生", &isUpdate);
 
 		// Particleの回転角度を調整する
-		ImGui::SliderAngle("Particle RotateZ", &particleRotateZ);
+		ImGui::SliderAngle("Z回転", &particleRotateZ);
 
 		//　フィールドON/OFFを切り替える
-		ImGui::Checkbox("Use Acceleration Field", &useAccelerationField);
+		//ImGui::Checkbox("加速度フィールド", &useAccelerationField);
+		//ImGui::DragFloat3("加速度##フィールド", &accelerationField.acceleration.x, 0.1f);
+		//ImGui::DragFloat3("範囲の最小##フィールド", &accelerationField.area.min.x, 0.1f);
+		//ImGui::DragFloat3("範囲の最大##フィールド", &accelerationField.area.max.x, 0.1f);
+
+		ImGui::Text("マウス: %d, %d", mousePos.x, mousePos.y);
+		static int clickCount = 0;
+		if (mouseTrigger) { clickCount++; }
+		ImGui::Text("クリック回数: %d", clickCount);
 
 		ImGui::Text("FPS: %.1f", ImGui::GetIO().Framerate);
-
-		// マテリアルカラー調整（任意）　 
-		static float fenceColor[4] = { 1.0f, 1.0f, 1.0f, 1.0f };
-		if (ImGui::ColorEdit4("Color", fenceColor)) {
-			materialDataFence->color.x = fenceColor[0];
-			materialDataFence->color.y = fenceColor[1];
-			materialDataFence->color.z = fenceColor[2];
-			materialDataFence->color.w = fenceColor[3];
-		}
 		ImGui::End();
 
 		ImGui::ShowDemoWindow();
@@ -1405,7 +1755,7 @@ int WINAPI WinMain(_In_ HINSTANCE, _In_opt_ HINSTANCE, _In_ LPSTR, _In_ int) {
 #endif
 
 		// Transform変数を作る 
-		//transform.rotate.y += 0.03f; 
+		//transform.rotate.y += 0.03f;  
 		Matrix4x4 worldMatrix = MyMath::MakeAffineMatrix(transform.scale, transform.rotate, transform.translate);
 		// ビュー行列の計算（フラグによって切り替え）
 		// デバッグカメラの更新
@@ -1422,6 +1772,31 @@ int WINAPI WinMain(_In_ HINSTANCE, _In_opt_ HINSTANCE, _In_ LPSTR, _In_ int) {
 		}
 		Matrix4x4 projectionMatrix = MyMath::MakePerspectiveFovMatrix(0.45f, float(WinApp::kClientWidth) / float(WinApp::kClientHeight), 0.1f, 100.0f);
 
+		// ---------- クリックした場所からパーティクルを出す ----------
+		bool clickOnUI = false;
+#ifdef USE_IMGUI
+		clickOnUI = ImGui::GetIO().WantCaptureMouse; // ImGuiのウィンドウ上のクリックは無視
+#endif
+		if (mouseTrigger && !clickOnUI) {
+			float ndcX = (float(mousePos.x) / float(WinApp::kClientWidth)) * 2.0f - 1.0f;
+			float ndcY = 1.0f - (float(mousePos.y) / float(WinApp::kClientHeight)) * 2.0f;
+
+			Matrix4x4 inverseViewProjection = MyMath::Inverse(MyMath::Multiply(viewMatrix, projectionMatrix));
+			Vector3 nearPoint = MyMath::Transform({ ndcX, ndcY, 0.0f }, inverseViewProjection); // 手前
+			Vector3 farPoint = MyMath::Transform({ ndcX, ndcY, 1.0f }, inverseViewProjection); // 奥 
+
+			float rate = -nearPoint.z / (farPoint.z - nearPoint.z);
+			Vector3 clickPosition = {
+				nearPoint.x + (farPoint.x - nearPoint.x) * rate,
+				nearPoint.y + (farPoint.y - nearPoint.y) * rate,
+				0.0f };
+
+			const uint32_t kBurstCount = 10;
+			for (uint32_t i = 0; i < kBurstCount; ++i) {
+				particles.push_back(MakeNewParticle(randomEngine, clickPosition));
+			}
+		}
+
 		// カメラのワールド位置をGPU用データに書き込む 
 		Matrix4x4 cameraWorldMatrix = MyMath::Inverse(viewMatrix);
 		cameraData->worldPosition = {
@@ -1430,15 +1805,26 @@ int WINAPI WinMain(_In_ HINSTANCE, _In_opt_ HINSTANCE, _In_ LPSTR, _In_ int) {
 			cameraWorldMatrix.m[3][2]
 		};
 
-		// Fenceの行列更新 
+		// Fenceの行列更新  
 		Matrix4x4 fenceWorldMatrix = MyMath::MakeAffineMatrix(fenceTransform.scale, fenceTransform.rotate, fenceTransform.translate);
 		Matrix4x4 fenceWvpMatrix = MyMath::Multiply(fenceWorldMatrix, MyMath::Multiply(viewMatrix, projectionMatrix));
+
+		// フィールドの行列更新
+		Matrix4x4 terrainWorldMatrix = MyMath::Multiply(
+			terrainModel.rootNode.localMatrix,                                                                    // 1つ目：Nodeの行列
+			MyMath::MakeAffineMatrix(terrainTransform.scale, terrainTransform.rotate, terrainTransform.translate) // 2つ目：今までのWorld行列
+		);
+		Matrix4x4 terrainWvpMatrix = MyMath::Multiply(terrainWorldMatrix, MyMath::Multiply(viewMatrix, projectionMatrix));
+
+		terrainWvpData->World = terrainWorldMatrix;
+		terrainWvpData->WVP = terrainWvpMatrix;
+		terrainWvpData->WorldInverseTranspose = MyMath::Transpose(MyMath::Inverse(terrainWorldMatrix));
 
 		fenceWvpData->World = fenceWorldMatrix;
 		fenceWvpData->WVP = fenceWvpMatrix;
 		fenceWvpData->WorldInverseTranspose = MyMath::Transpose(MyMath::Inverse(fenceWorldMatrix));
 
-		// ビルボード行列（カメラの回転だけを取り出す）
+		// ビルボード行列（カメラの回転だけを取り出す） 
 		Matrix4x4 billboardMatrix = MyMath::Identity();
 		if (useBillboard) {
 			billboardMatrix = MyMath::Inverse(viewMatrix); // = カメラ行列
@@ -1447,17 +1833,20 @@ int WINAPI WinMain(_In_ HINSTANCE, _In_opt_ HINSTANCE, _In_ LPSTR, _In_ int) {
 			billboardMatrix.m[3][2] = 0.0f;
 		}
 
-		// Emitterの更新：時間がたつと、自動でParticleを発生させる 
-		if (isUpdate) {
-			emitter.frequencyTime += kDeltaTime;                                 // 時刻を進める 
-			if (emitter.frequency <= emitter.frequencyTime) {                    // 頻度より大きければ発生
-				particles.splice(particles.end(), Emit(emitter, randomEngine));
-				emitter.frequencyTime -= emitter.frequency;                      // 余計に過ぎた時間も加味して頻度計算する
+		// Emitterの更新：時間がたつと、自動でParticleを発生させる
+		if (isUpdate && useAutoEmit) {
+			if (isUpdate) {
+				emitter.frequencyTime += kDeltaTime;                                 // 時刻を進める 
+				if (emitter.frequency <= emitter.frequencyTime) {                    // 頻度より大きければ発生
+					particles.splice(particles.end(), Emit(emitter, randomEngine));
+					emitter.frequencyTime -= emitter.frequency;                      // 余計に過ぎた時間も加味して頻度計算する
+				}
 			}
 		}
 
-		// Instancing用：生きている Particle だけを更新して書き込む  
+		// Instancing用：生きている Particle だけを更新して書き込む
 		uint32_t numInstance = 0;
+		uint32_t shapeInstanceCount[kNumShapes] = {};
 		for (std::list<Particle>::iterator particleIterator = particles.begin();
 			particleIterator != particles.end(); ) {
 
@@ -1476,31 +1865,72 @@ int WINAPI WinMain(_In_ HINSTANCE, _In_opt_ HINSTANCE, _In_ LPSTR, _In_ int) {
 				}
 			}
 
-			// 生きている Particle の場合は、位置を更新する
+
+			// 時間を進める
 			if (isUpdate) {
-				(*particleIterator).transform.translate.x += (*particleIterator).velocity.x * kDeltaTime;
-				(*particleIterator).transform.translate.y += (*particleIterator).velocity.y * kDeltaTime;
-				(*particleIterator).transform.translate.z += (*particleIterator).velocity.z * kDeltaTime;
 				(*particleIterator).currentTime += kDeltaTime;
+
+				// 回転を進める 
+				(*particleIterator).transform.rotate.x += (*particleIterator).angularVelocity.x * kDeltaTime;
+				(*particleIterator).transform.rotate.y += (*particleIterator).angularVelocity.y * kDeltaTime;
+				(*particleIterator).transform.rotate.z += (*particleIterator).angularVelocity.z * kDeltaTime;
 			}
 
-			if (numInstance < kNumMaxInstances) {
+			// 寿命の進み具合（0.0〜1.0）
+			float t = (*particleIterator).currentTime / (*particleIterator).lifeTime;
+			if (t > 1.0f) { t = 1.0f; }
+
+			// 前半は広がる、後半はそれを逆再生して戻る
+			float p = 0.0f;
+			if (t < 0.5f) {
+				p = EaseOutCubic(t / 0.5f);          // 0 → 1
+			}
+			else {
+				p = EaseOutCubic((1.0f - t) / 0.5f); // 1 → 0
+			}
+
+			// 位置 = 中心 + ずれ × 進み具合
+			(*particleIterator).transform.translate = {
+				(*particleIterator).startPosition.x + (*particleIterator).targetOffset.x * p,
+				(*particleIterator).startPosition.y + (*particleIterator).targetOffset.y * p,
+				(*particleIterator).startPosition.z + (*particleIterator).targetOffset.z * p };
+
+			uint32_t shape = (*particleIterator).shapeIndex;
+			if (shapeInstanceCount[shape] < kNumMaxInstances) {
+
+				// 書き込む場所 = その形の区切りの先頭 + その形の何個目か
+				uint32_t writeIndex = shape * kNumMaxInstances + shapeInstanceCount[shape];
+				float s = 0.0f;
+				if (t < 0.5f) {
+					s = EaseOutBack(t / 0.5f);
+				}
+				else {
+					s = EaseOutBack((1.0f - t) / 0.5f);  // 逆再生でしゅっと縮む 
+				}
+
+				// 元の大きさに倍率を掛ける
+				Vector3 easedScale = {
+					(*particleIterator).transform.scale.x * s,
+					(*particleIterator).transform.scale.y * s,
+					(*particleIterator).transform.scale.z * s };
+
 				Matrix4x4 scaleMatrix = MyMath::MakeAffineMatrix(
-					(*particleIterator).transform.scale, { 0.0f, 0.0f, 0.0f }, { 0.0f, 0.0f, 0.0f });
+					easedScale, (*particleIterator).transform.rotate, { 0.0f, 0.0f, 0.0f });
+
 				Matrix4x4 translateMatrix = MyMath::MakeAffineMatrix(
 					{ 1.0f, 1.0f, 1.0f }, { 0.0f, 0.0f, 0.0f }, (*particleIterator).transform.translate);
 				Matrix4x4 worldMatrix = MyMath::Multiply(scaleMatrix, MyMath::Multiply(billboardMatrix, translateMatrix));
 				Matrix4x4 worldViewProjectionMatrix =
 					MyMath::Multiply(worldMatrix, MyMath::Multiply(viewMatrix, projectionMatrix));
 
-				instancingData[numInstance].WVP = worldViewProjectionMatrix;
-				instancingData[numInstance].World = worldMatrix;
-				instancingData[numInstance].color = (*particleIterator).color;
+				instancingData[writeIndex].WVP = worldViewProjectionMatrix;
+				instancingData[writeIndex].World = worldMatrix;
+				instancingData[writeIndex].color = (*particleIterator).color;
 
 				float alpha = 1.0f - ((*particleIterator).currentTime / (*particleIterator).lifeTime);
-				instancingData[numInstance].color.w = alpha;
+				instancingData[writeIndex].color.w = alpha;
 
-				++numInstance;
+				++shapeInstanceCount[shape];
 			}
 			++particleIterator; // ifの外
 		}
@@ -1525,8 +1955,23 @@ int WINAPI WinMain(_In_ HINSTANCE, _In_opt_ HINSTANCE, _In_ LPSTR, _In_ int) {
 		commandList->SetGraphicsRootDescriptorTable(2, textureSrvHandleGPU2);
 		commandList->SetGraphicsRootConstantBufferView(3, directionalLightResource->GetGPUVirtualAddress());
 		commandList->SetGraphicsRootConstantBufferView(4, cameraResource->GetGPUVirtualAddress());
+		commandList->SetGraphicsRootConstantBufferView(5, pointLightResource->GetGPUVirtualAddress());
+		commandList->SetGraphicsRootConstantBufferView(6, spotLightResource->GetGPUVirtualAddress());
 
-		commandList->DrawIndexedInstanced(kSphereIndexCount, 1, 0, 0, 0);
+		// commandList->DrawIndexedInstanced(kSphereIndexCount, 1, 0, 0, 0);
+
+
+		// =================================
+		// フィールドの描画
+		// =================================
+		commandList->SetGraphicsRootConstantBufferView(0, terrainWvpResource->GetGPUVirtualAddress());
+		commandList->SetGraphicsRootConstantBufferView(1, materialResourceTerrain->GetGPUVirtualAddress());
+		commandList->SetGraphicsRootDescriptorTable(2, textureSrvHandleGPU3);
+
+		//for (const auto& mesh : terrainModel.meshes) {
+		//	commandList->IASetVertexBuffers(0, 1, &mesh.vertexBufferView);
+		//	commandList->DrawInstanced(static_cast<UINT>(mesh.vertices.size()), 1, 0, 0);
+		//}
 
 		// 共通設定
 		commandList->SetGraphicsRootSignature(particleRootSignature.Get());
@@ -1538,17 +1983,21 @@ int WINAPI WinMain(_In_ HINSTANCE, _In_opt_ HINSTANCE, _In_ LPSTR, _In_ int) {
 		// トポロジ
 		commandList->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
 
-		// [0] Instancing用 StructuredBuffer (VS / t0) 
-		commandList->SetGraphicsRootDescriptorTable(0, instancingSrvHandleGPU);
 		// [1] Material (PS / b0)
-		commandList->SetGraphicsRootConstantBufferView(1, materialResourceFence->GetGPUVirtualAddress());
+		commandList->SetGraphicsRootConstantBufferView(1, materialResourceParticle->GetGPUVirtualAddress());
 		// [2] Texture (PS / t0)
 		commandList->SetGraphicsRootDescriptorTable(2, textureSrvHandleGPU);
 
-		// 描画：6頂点の板ポリゴンを kNumInstances 回 
-		for (const auto& mesh : fenceModel.meshes) {
-			commandList->IASetVertexBuffers(0, 1, &mesh.vertexBufferView);
-			commandList->DrawInstanced(static_cast<UINT>(mesh.vertices.size()), numInstance, 0, 0);
+		// 形ごとに描画する
+		for (uint32_t shape = 0; shape < kNumShapes; ++shape) {
+			if (shapeInstanceCount[shape] == 0) { continue; } // その形が1つもなければ飛ばす 
+
+			commandList->SetGraphicsRootDescriptorTable(0, shapeSrvHandleGPU[shape]);
+
+			for (const auto& mesh : particleModels[shape].meshes) {
+				commandList->IASetVertexBuffers(0, 1, &mesh.vertexBufferView);
+				commandList->DrawInstanced(static_cast<UINT>(mesh.vertices.size()), shapeInstanceCount[shape], 0, 0);
+			}
 		}
 
 

@@ -40,7 +40,7 @@ void WinApp::Initialize() {
 
 	hwnd = CreateWindow(
 		wc.lpszClassName,       // 利用するクラス名
-		L"CG2",                 // タイトルバーの文字
+		L"LE2B_01_ウスイ_ナナミ",                 // タイトルバーの文字
 		WS_OVERLAPPEDWINDOW,    // よく見るウィンドウスタイル
 		CW_USEDEFAULT,          // 表示X座標（Windowsに任せる）
 		CW_USEDEFAULT,          // 表示Y座標（WindowsOSに任せる）　
