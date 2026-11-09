@@ -1,3 +1,5 @@
+#define _USE_MATH_DEFINES
+#include <cmath>
 #include <Windows.h>    // Windows APIを使うためのヘッダ
 #include <cstdint>      // int32_tなどの整数型を使うためのヘッダ
 #include <string>       // std::string 文字列を扱うためのヘッダ
@@ -589,6 +591,30 @@ bool IsCollision(const AABB& aabb, const Vector3& point) {
 		(point.z >= aabb.min.z && point.z <= aabb.max.z);
 }
 
+// 点光源構造体
+struct PointLight {
+	Vector4 color;    // 点光源の色 
+	Vector3 position; // 点光源の位置
+	float intensity;  // 点光源の強度
+	float radius;        // 点光源の有効範囲
+	float decay;         // 減衰係数
+	float padding[2];    // パディング
+};
+
+// スポットライト構造体
+struct SpotLight {
+	Vector4 color;     // スポットライトの色
+	Vector3 position;  // スポットライトの位置
+	float intensity;   // スポットライトの強度
+	Vector3 direction; // スポットライトの方向
+	float distance;    // スポットライトの有効距離
+	float decay;       // 減衰係数
+	float cosAngle;    // スポットライトの角度（ラジアン）
+	float cosFalloffStart; // Falloff開始角度（ラジアンのcos) spotLightData
+	float padding[2];  // パディング
+};
+
+
 // ====================================================
 // ---------- Windowsアプリのエントリーポイント ---------  
 // ====================================================
@@ -669,7 +695,7 @@ int WINAPI WinMain(_In_ HINSTANCE, _In_opt_ HINSTANCE, _In_ LPSTR, _In_ int) {
 	descriptorRange[0].OffsetInDescriptorsFromTableStart = D3D12_DESCRIPTOR_RANGE_OFFSET_APPEND;
 
 	// RootParameter作成 
-	D3D12_ROOT_PARAMETER rootParameters[5] = {};
+	D3D12_ROOT_PARAMETER rootParameters[7] = {};
 	rootParameters[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_CBV;
 	rootParameters[0].ShaderVisibility = D3D12_SHADER_VISIBILITY_VERTEX;
 	rootParameters[0].Descriptor.ShaderRegister = 0;
@@ -696,6 +722,16 @@ int WINAPI WinMain(_In_ HINSTANCE, _In_opt_ HINSTANCE, _In_ LPSTR, _In_ int) {
 	rootParameters[4].ParameterType = D3D12_ROOT_PARAMETER_TYPE_CBV;
 	rootParameters[4].ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
 	rootParameters[4].Descriptor.ShaderRegister = 2;
+
+	// PointLight用 (b3)
+	rootParameters[5].ParameterType = D3D12_ROOT_PARAMETER_TYPE_CBV;
+	rootParameters[5].ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
+	rootParameters[5].Descriptor.ShaderRegister = 3;
+
+	// SpotLight用 (b4)
+	rootParameters[6].ParameterType = D3D12_ROOT_PARAMETER_TYPE_CBV;
+	rootParameters[6].ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
+	rootParameters[6].Descriptor.ShaderRegister = 4;
 
 	// StaticSamplerの設定  
 	D3D12_STATIC_SAMPLER_DESC staticSamplers[1] = {};
@@ -1028,6 +1064,24 @@ int WINAPI WinMain(_In_ HINSTANCE, _In_opt_ HINSTANCE, _In_ LPSTR, _In_ int) {
 	CreateSphereVertices(sphere, sphereVertexData, kSubdivision);
 	sphereVertexResource->Unmap(0, nullptr);
 
+	// ====================================================
+    // フィールド
+    // ====================================================
+	ModelData terrainModel = LoadObjFile("resources/terrain", "terrain.obj");
+
+	for (auto& mesh : terrainModel.meshes) {
+		mesh.vertexResource = dxCommon->CreateBufferResource(sizeof(VertexData) * mesh.vertices.size());
+
+		mesh.vertexBufferView.BufferLocation = mesh.vertexResource->GetGPUVirtualAddress();
+		mesh.vertexBufferView.SizeInBytes = UINT(sizeof(VertexData) * mesh.vertices.size());
+		mesh.vertexBufferView.StrideInBytes = sizeof(VertexData);
+
+		VertexData* mappedData = nullptr;
+		mesh.vertexResource->Map(0, nullptr, reinterpret_cast<void**>(&mappedData));
+		std::memcpy(mappedData, mesh.vertices.data(), sizeof(VertexData) * mesh.vertices.size());
+		mesh.vertexResource->Unmap(0, nullptr);
+	}
+
 	// --- インデックスバッファ ---
 	Microsoft::WRL::ComPtr<ID3D12Resource> sphereIndexResource =
 		dxCommon->CreateBufferResource(sizeof(uint32_t) * kSphereIndexCount);
@@ -1037,6 +1091,7 @@ int WINAPI WinMain(_In_ HINSTANCE, _In_opt_ HINSTANCE, _In_ LPSTR, _In_ int) {
 	sphereIndexBufferView.SizeInBytes = UINT(sizeof(uint32_t) * kSphereIndexCount);
 	sphereIndexBufferView.Format = DXGI_FORMAT_R32_UINT;
 
+	// インデックスバッファにデータ転送 
 	uint32_t* sphereIndexData = nullptr;
 	sphereIndexResource->Map(0, nullptr, reinterpret_cast<void**>(&sphereIndexData));
 	CreateSphereIndices(sphereIndexData, kSubdivision);
@@ -1055,7 +1110,7 @@ int WINAPI WinMain(_In_ HINSTANCE, _In_opt_ HINSTANCE, _In_ LPSTR, _In_ int) {
 		mesh.vertexResource->Unmap(0, nullptr);
 	}
 
-	// fence用マテリアル
+	// Obj用マテリアル
 	Microsoft::WRL::ComPtr<ID3D12Resource> materialResourceFence =
 		dxCommon->CreateBufferResource(sizeof(Material));
 
@@ -1077,6 +1132,29 @@ int WINAPI WinMain(_In_ HINSTANCE, _In_opt_ HINSTANCE, _In_ LPSTR, _In_ int) {
 	fenceWvpData->World = MyMath::Identity();
 	fenceWvpData->WorldInverseTranspose = MyMath::Identity();
 
+	// フィールド用マテリアル
+	Microsoft::WRL::ComPtr<ID3D12Resource> materialResourceTerrain =
+		dxCommon->CreateBufferResource(sizeof(Material));
+
+	Material* materialDataTerrain = nullptr;
+	materialResourceTerrain->Map(0, nullptr, reinterpret_cast<void**>(&materialDataTerrain));
+	materialDataTerrain->color = { 1.0f, 1.0f, 1.0f, 1.0f };
+	materialDataTerrain->lightingType = Lighting_Lambert;   // 下の補足を参照
+	materialDataTerrain->uvTransform = MyMath::Identity();
+	materialDataTerrain->shininess = 50.0f;
+	materialResourceTerrain->Unmap(0, nullptr);
+
+	// フィールド用のTransform変数とWVPリソース
+	Transform terrainTransform = { {1.0f, 1.0f, 1.0f}, {0.0f, 0.0f, 0.0f}, {0.0f, 0.0f, 0.0f} };
+
+	Microsoft::WRL::ComPtr<ID3D12Resource> terrainWvpResource =
+		dxCommon->CreateBufferResource(sizeof(TransformationMatrix));
+	TransformationMatrix* terrainWvpData = nullptr;
+	terrainWvpResource->Map(0, nullptr, reinterpret_cast<void**>(&terrainWvpData));
+	terrainWvpData->WVP = MyMath::Identity();
+	terrainWvpData->World = MyMath::Identity();
+	terrainWvpData->WorldInverseTranspose = MyMath::Identity();
+
 
 	// --- 平行光源用 ---  　 
 	Microsoft::WRL::ComPtr<ID3D12Resource> directionalLightResource =
@@ -1084,10 +1162,45 @@ int WINAPI WinMain(_In_ HINSTANCE, _In_opt_ HINSTANCE, _In_ LPSTR, _In_ int) {
 	DirectionalLight* directionalLightData = nullptr;
 	directionalLightResource->Map(0, nullptr, reinterpret_cast<void**>(&directionalLightData));
 
-	// 初期値
+	// --- 点光源用 ---
+	Microsoft::WRL::ComPtr<ID3D12Resource> pointLightResource =
+		dxCommon->CreateBufferResource(sizeof(PointLight));
+	PointLight* pointLightData = nullptr;
+	pointLightResource->Map(0, nullptr, reinterpret_cast<void**>(&pointLightData));
+
+	// --- スポットライト用 ---
+	Microsoft::WRL::ComPtr<ID3D12Resource> spotLightResource =
+		dxCommon->CreateBufferResource(sizeof(SpotLight));
+	SpotLight* spotLightData = nullptr;
+	spotLightResource->Map(0, nullptr, reinterpret_cast<void**>(&spotLightData));
+
+	// スポットライトの初期値設定
+	spotLightData->color = { 1.0f, 1.0f, 1.0f, 1.0f };
+	spotLightData->position = { 2.0f, 1.25f, 0.0f };
+	spotLightData->distance = 7.0f;
+	spotLightData->direction = MyMath::Normalize({ -1.0f, -1.0f, 0.0f });
+	spotLightData->intensity = 4.0f;
+	spotLightData->decay = 2.0f;
+	spotLightData->cosAngle = std::cos(static_cast<float>(M_PI) / 3.0f);
+	spotLightData->cosFalloffStart = std::cos(static_cast<float>(M_PI) / 6.0f);
+	// 角度の初期値
+	static float spotAngle = static_cast<float>(M_PI) / 3.0f;
+	static float falloffStartAngle = static_cast<float>(M_PI) / 6.0f;
+	spotLightData->cosAngle = std::cos(spotAngle);
+	spotLightData->cosFalloffStart = std::cos(falloffStartAngle);
+
+	// 平行光源の初期値設定 
 	directionalLightData->color = { 1.0f,1.0f,1.0f,1.0f };
 	directionalLightData->direction = MyMath::Normalize({ 0.0f, -1.0f, 0.0f });
 	directionalLightData->intensity = 1.0f;
+
+	// 点光源の初期値設定 
+	pointLightData->color = { 1.0f, 1.0f, 1.0f, 1.0f };
+	pointLightData->position = { 0.0f, 2.0f, 0.0f };
+	pointLightData->intensity = 1.0f;
+	pointLightData->radius = 10.0f;
+	pointLightData->decay = 2.0f;
+
 
 	// --- カメラ用 ---
 	Microsoft::WRL::ComPtr<ID3D12Resource> cameraResource =
@@ -1217,7 +1330,24 @@ int WINAPI WinMain(_In_ HINSTANCE, _In_opt_ HINSTANCE, _In_ LPSTR, _In_ int) {
 	// SRVを生成 
 	device->CreateShaderResourceView(textureResource2.Get(), &srvDesc2, textureSrvHandleCPU2);
 
-	// 切り替え用 
+	// ----- フィールド用テクスチャ(3枚目)-----
+	DirectX::ScratchImage mipImages3 = DirectXCommon::LoadTexture(terrainModel.meshes[0].material.textureFilePath);
+	const DirectX::TexMetadata& metadata3 = mipImages3.GetMetadata();
+	Microsoft::WRL::ComPtr<ID3D12Resource> textureResource3 =
+		dxCommon->CreateTextureResource(metadata3);
+	ID3D12Resource* intermediateResource3 = dxCommon->UploadTextureData(textureResource3.Get(), mipImages3);
+
+	D3D12_SHADER_RESOURCE_VIEW_DESC srvDesc3{};
+	srvDesc3.Format = metadata3.format;
+	srvDesc3.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+	srvDesc3.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+	srvDesc3.Texture2D.MipLevels = UINT(metadata3.mipLevels);
+
+	D3D12_CPU_DESCRIPTOR_HANDLE textureSrvHandleCPU3 = dxCommon->GetSRVCPUDescriptorHandle(4);
+	D3D12_GPU_DESCRIPTOR_HANDLE textureSrvHandleGPU3 = dxCommon->GetSRVGPUDescriptorHandle(4);
+	device->CreateShaderResourceView(textureResource3.Get(), &srvDesc3, textureSrvHandleCPU3);
+
+	// 切り替え用 　
 	bool useMonsterBall = true;
 
 	// コマンドリストをクローズ 
@@ -1237,6 +1367,7 @@ int WINAPI WinMain(_In_ HINSTANCE, _In_opt_ HINSTANCE, _In_ LPSTR, _In_ int) {
 		WaitForSingleObject(dxCommon->GetFenceEvent(), INFINITE);
 	}
 
+
 	// メインループで使えるようにコマンドリストとアロケータをリセットする
 	hr = dxCommon->GetCommandAllocator()->Reset();
 	assert(SUCCEEDED(hr));
@@ -1246,6 +1377,7 @@ int WINAPI WinMain(_In_ HINSTANCE, _In_opt_ HINSTANCE, _In_ LPSTR, _In_ int) {
 	// 一時転送バッファの解放
 	intermediateResource->Release();
 	intermediateResource2->Release();
+	intermediateResource3->Release();
 
 
 	// ============================================
@@ -1333,11 +1465,35 @@ int WINAPI WinMain(_In_ HINSTANCE, _In_opt_ HINSTANCE, _In_ LPSTR, _In_ int) {
 			}
 		}
 
+		// --- PointLight ---
+		ImGui::ColorEdit4("PointLight Color", &pointLightData->color.x);
+		ImGui::DragFloat3("PointLight Position", &pointLightData->position.x, 0.1f);
+		ImGui::SliderFloat("PointLight Intensity", &pointLightData->intensity, 0.0f, 5.0f);
+
+		// --- SpotLight ---
+		ImGui::ColorEdit4("SpotLight Color", &spotLightData->color.x);
+		ImGui::DragFloat3("SpotLight Position", &spotLightData->position.x, 0.1f);
+		ImGui::SliderFloat("SpotLight Intensity", &spotLightData->intensity, 0.0f, 5.0f);
+
+		// 角度調整用スライダー
+		bool angleChanged = false;
+		angleChanged |= ImGui::SliderAngle("SpotLight Angle", &spotAngle, 0.0f, 89.0f);
+		angleChanged |= ImGui::SliderAngle("SpotLight FalloffStart", &falloffStartAngle, 0.0f, 89.0f);
+		// 角度の制限
+		if (falloffStartAngle >= spotAngle) {
+			falloffStartAngle = spotAngle - 0.001f;
+		}
+		// cos値を計算してGPU用データに書き込む
+		if (angleChanged) {
+			spotLightData->cosAngle = std::cos(spotAngle);
+			spotLightData->cosFalloffStart = std::cos(falloffStartAngle);
+		}
+
 		// 光の強さ  
 		ImGui::SliderFloat("Intensity", &directionalLightData->intensity, 0.0f, 5.0f);
 
 		// ---------------------------------
-		// デバックカメラ切り替え
+		// デバックカメラ切り替え 
 		// ---------------------------------　
 		ImGui::SeparatorText("Camera");
 		ImGui::Checkbox("Use Debug Camera", &useDebugCamera);
@@ -1405,7 +1561,7 @@ int WINAPI WinMain(_In_ HINSTANCE, _In_opt_ HINSTANCE, _In_ LPSTR, _In_ int) {
 #endif
 
 		// Transform変数を作る 
-		//transform.rotate.y += 0.03f; 
+		//transform.rotate.y += 0.03f;  
 		Matrix4x4 worldMatrix = MyMath::MakeAffineMatrix(transform.scale, transform.rotate, transform.translate);
 		// ビュー行列の計算（フラグによって切り替え）
 		// デバッグカメラの更新
@@ -1434,6 +1590,14 @@ int WINAPI WinMain(_In_ HINSTANCE, _In_opt_ HINSTANCE, _In_ LPSTR, _In_ int) {
 		Matrix4x4 fenceWorldMatrix = MyMath::MakeAffineMatrix(fenceTransform.scale, fenceTransform.rotate, fenceTransform.translate);
 		Matrix4x4 fenceWvpMatrix = MyMath::Multiply(fenceWorldMatrix, MyMath::Multiply(viewMatrix, projectionMatrix));
 
+		// フィールドの行列更新
+		Matrix4x4 terrainWorldMatrix = MyMath::MakeAffineMatrix(terrainTransform.scale, terrainTransform.rotate, terrainTransform.translate);
+		Matrix4x4 terrainWvpMatrix = MyMath::Multiply(terrainWorldMatrix, MyMath::Multiply(viewMatrix, projectionMatrix));
+
+		terrainWvpData->World = terrainWorldMatrix;
+		terrainWvpData->WVP = terrainWvpMatrix;
+		terrainWvpData->WorldInverseTranspose = MyMath::Transpose(MyMath::Inverse(terrainWorldMatrix));
+
 		fenceWvpData->World = fenceWorldMatrix;
 		fenceWvpData->WVP = fenceWvpMatrix;
 		fenceWvpData->WorldInverseTranspose = MyMath::Transpose(MyMath::Inverse(fenceWorldMatrix));
@@ -1447,7 +1611,7 @@ int WINAPI WinMain(_In_ HINSTANCE, _In_opt_ HINSTANCE, _In_ LPSTR, _In_ int) {
 			billboardMatrix.m[3][2] = 0.0f;
 		}
 
-		// Emitterの更新：時間がたつと、自動でParticleを発生させる 
+		// Emitterの更新：時間がたつと、自動でParticleを発生させる
 		if (isUpdate) {
 			emitter.frequencyTime += kDeltaTime;                                 // 時刻を進める 
 			if (emitter.frequency <= emitter.frequencyTime) {                    // 頻度より大きければ発生
@@ -1525,8 +1689,23 @@ int WINAPI WinMain(_In_ HINSTANCE, _In_opt_ HINSTANCE, _In_ LPSTR, _In_ int) {
 		commandList->SetGraphicsRootDescriptorTable(2, textureSrvHandleGPU2);
 		commandList->SetGraphicsRootConstantBufferView(3, directionalLightResource->GetGPUVirtualAddress());
 		commandList->SetGraphicsRootConstantBufferView(4, cameraResource->GetGPUVirtualAddress());
+		commandList->SetGraphicsRootConstantBufferView(5, pointLightResource->GetGPUVirtualAddress());
+		commandList->SetGraphicsRootConstantBufferView(6, spotLightResource->GetGPUVirtualAddress());
 
 		commandList->DrawIndexedInstanced(kSphereIndexCount, 1, 0, 0, 0);
+
+
+		// =================================
+        // フィールドの描画
+        // =================================
+		commandList->SetGraphicsRootConstantBufferView(0, terrainWvpResource->GetGPUVirtualAddress());
+		commandList->SetGraphicsRootConstantBufferView(1, materialResourceTerrain->GetGPUVirtualAddress());
+		commandList->SetGraphicsRootDescriptorTable(2, textureSrvHandleGPU3);
+
+		for (const auto& mesh : terrainModel.meshes) {
+			commandList->IASetVertexBuffers(0, 1, &mesh.vertexBufferView);
+			commandList->DrawInstanced(static_cast<UINT>(mesh.vertices.size()), 1, 0, 0);
+		}
 
 		// 共通設定
 		commandList->SetGraphicsRootSignature(particleRootSignature.Get());

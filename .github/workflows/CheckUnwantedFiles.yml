@@ -8,6 +8,7 @@ on:
   push:
     branches:
       - master
+      - GE3_04
 
 env:
   UNWANTED_NAME_PATTERNS: "*.pdb *.ilk *.user *.ncb *.suo *.log *.dmp *.zip imgui.ini desktop.ini dxcompiler.dll dxil.dll"
