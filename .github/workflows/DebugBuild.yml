@@ -4,6 +4,8 @@ on:
   push:
     branches:
       - master
+      - GE3_04
+      workflow_dispatch:
 
 env:
   # リポジトリのルートディレクトリを基準としたソリューションファイルのパス
